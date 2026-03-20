@@ -10,7 +10,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, PerspectiveCamera, Stars, Environment, Float, Text, ContactShadows, useTexture, RoundedBox } from '@react-three/drei';
 import * as THREE from 'three';
 import { NBA_ROSTER } from './data/roster';
-import { Player as PlayerType, CareerPlayer, CardTier } from './types';
+import { Player as PlayerType, CareerPlayer, CardTier, TutorialStep } from './types';
 import { auth, db, googleProvider, signInWithPopup, signOut, onAuthStateChanged } from './firebase';
 import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
 
@@ -740,6 +740,72 @@ function MyTeamCard({ player, isSelected, onClick, showStats = true }: {
   );
 }
 
+function TutorialOverlay({ steps, onComplete }: { steps: TutorialStep[], onComplete: () => void }) {
+  const [currentStep, setCurrentStep] = useState(0);
+  const step = steps[currentStep];
+
+  const nextStep = () => {
+    if (currentStep < steps.length - 1) {
+      setCurrentStep(currentStep + 1);
+    } else {
+      onComplete();
+    }
+  };
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-8"
+      >
+        <motion.div
+          initial={{ scale: 0.9, opacity: 0, y: 20 }}
+          animate={{ scale: 1, opacity: 1, y: 0 }}
+          className="bg-[#151515] border border-[#ce1141]/50 p-8 max-w-md w-full relative overflow-hidden"
+        >
+          {/* Decorative background element */}
+          <div className="absolute -top-24 -right-24 w-48 h-48 bg-[#ce1141]/10 rounded-full blur-3xl" />
+          
+          <div className="relative z-10">
+            <div className="flex justify-between items-start mb-6">
+              <div>
+                <h3 className="text-[10px] font-black uppercase tracking-[0.3em] text-[#ce1141] mb-2">Tutorial Step {currentStep + 1}/{steps.length}</h3>
+                <h2 className="text-3xl font-black italic uppercase tracking-tighter">{step.title}</h2>
+              </div>
+              <button onClick={onComplete} className="text-white/20 hover:text-white transition-colors">
+                <X size={20} />
+              </button>
+            </div>
+            
+            <p className="text-white/60 text-sm leading-relaxed mb-8">
+              {step.description}
+            </p>
+            
+            <div className="flex justify-between items-center">
+              <div className="flex gap-1">
+                {steps.map((_, i) => (
+                  <div 
+                    key={i} 
+                    className={`h-1 rounded-full transition-all ${i === currentStep ? 'w-4 bg-[#ce1141]' : 'w-1 bg-white/10'}`} 
+                  />
+                ))}
+              </div>
+              <button 
+                onClick={nextStep}
+                className="bg-white text-black px-6 py-2 font-black text-[10px] uppercase tracking-widest hover:bg-[#ce1141] hover:text-white transition-all flex items-center gap-2"
+              >
+                {currentStep === steps.length - 1 ? 'Finish' : 'Next'} <ChevronRight size={14} />
+              </button>
+            </div>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
 // --- Main App Component ---
 
 export default function App() {
@@ -766,6 +832,64 @@ export default function App() {
   const [takeoverMeter, setTakeoverMeter] = useState(0);
   const [isTakeoverActive, setIsTakeoverActive] = useState(false);
   
+  // --- Tutorial States ---
+  const [activeTutorial, setActiveTutorial] = useState<TutorialStep[] | null>(null);
+  const [completedTutorials, setCompletedTutorials] = useState<string[]>([]);
+
+  const tutorials = {
+    myCareer: [
+      {
+        title: "Welcome to MyCAREER",
+        description: "This is where you build your legacy. Create your player, upgrade attributes, and rise to NBA stardom.",
+        position: "center"
+      },
+      {
+        title: "Attributes & Badges",
+        description: "Use VC earned from games to upgrade your attributes. Unlock and equip badges to gain elite abilities on the court.",
+        position: "center"
+      },
+      {
+        title: "The City",
+        description: "Explore the City to find pickup games, training facilities, and more. Your journey starts here.",
+        position: "center"
+      }
+    ] as TutorialStep[],
+    myTeam: [
+      {
+        title: "Welcome to MyTEAM",
+        description: "Build your fantasy squad by collecting player cards. Open packs, complete challenges, and dominate the competition.",
+        position: "center"
+      },
+      {
+        title: "Lineup Management",
+        description: "Assemble your best 5 starters. Mix and match players to find the perfect chemistry for your playstyle.",
+        position: "center"
+      },
+      {
+        title: "The Store",
+        description: "Visit the store to spend your VC on new packs. Look out for limited-time drops and legendary players.",
+        position: "center"
+      }
+    ] as TutorialStep[]
+  };
+
+  useEffect(() => {
+    if (view === 'myCareer' && !completedTutorials.includes('myCareer')) {
+      setActiveTutorial(tutorials.myCareer);
+    } else if (view === 'myTeam' && !completedTutorials.includes('myTeam')) {
+      setActiveTutorial(tutorials.myTeam);
+    }
+  }, [view, completedTutorials]);
+
+  const completeTutorial = (tutorialKey: string) => {
+    setCompletedTutorials(prev => {
+      const updated = [...prev, tutorialKey];
+      localStorage.setItem('completedTutorials', JSON.stringify(updated));
+      return updated;
+    });
+    setActiveTutorial(null);
+  };
+
   // --- Game Loop for HUD ---
   useEffect(() => {
     if (view !== 'game') return;
@@ -923,6 +1047,9 @@ export default function App() {
 
       const savedXP = localStorage.getItem('myTeamXP');
       if (savedXP) setMyTeamXP(parseInt(savedXP));
+
+      const savedTutorials = localStorage.getItem('completedTutorials');
+      if (savedTutorials) setCompletedTutorials(JSON.parse(savedTutorials));
 
       const savedMyTeam = localStorage.getItem('myTeam');
       if (savedMyTeam) setMyTeam(JSON.parse(savedMyTeam));
@@ -2286,6 +2413,13 @@ export default function App() {
           </motion.main>
         )}
       </AnimatePresence>
+
+      {activeTutorial && (
+        <TutorialOverlay 
+          steps={activeTutorial} 
+          onComplete={() => completeTutorial(view)} 
+        />
+      )}
     </div>
   );
 }

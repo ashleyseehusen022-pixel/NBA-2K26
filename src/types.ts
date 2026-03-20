@@ -83,3 +83,10 @@ export interface CareerPlayer {
     type: 'Clothing' | 'Animation' | 'Boost';
   }[];
 }
+
+export interface TutorialStep {
+  title: string;
+  description: string;
+  target?: string; // CSS selector for highlighting
+  position: 'top' | 'bottom' | 'left' | 'right' | 'center';
+}
