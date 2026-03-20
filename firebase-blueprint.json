@@ -1,0 +1,23 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and game progress",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "description": "User email" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "vc": { "type": "integer", "description": "Virtual Currency balance" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Account creation timestamp" }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User documents stored by UID"
+    }
+  }
+}
