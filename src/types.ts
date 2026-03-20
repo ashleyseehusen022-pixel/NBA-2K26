@@ -26,6 +26,7 @@ export interface Player {
     defense: number;
     playmaking: number;
     athleticism: number;
+    rebounding: number;
     iq: number;
     consistency: number;
   };
@@ -80,8 +81,17 @@ export interface CareerPlayer {
   inventory: {
     id: string;
     name: string;
-    type: 'Clothing' | 'Animation' | 'Boost';
+    type: 'Clothing' | 'Animation' | 'Boost' | 'Signature Move';
+    equipped?: boolean;
   }[];
+}
+
+export interface ProgressionReward {
+  level: number;
+  type: 'Animation' | 'Signature Move' | 'Endorsement' | 'Attribute Boost' | 'Badge';
+  name: string;
+  description: string;
+  id: string;
 }
 
 export interface TutorialStep {

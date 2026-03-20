@@ -10,9 +10,10 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, PerspectiveCamera, Stars, Environment, Float, Text, ContactShadows, useTexture, RoundedBox } from '@react-three/drei';
 import * as THREE from 'three';
 import { NBA_ROSTER } from './data/roster';
-import { Player as PlayerType, CareerPlayer, CardTier, TutorialStep } from './types';
+import { Player as PlayerType, CareerPlayer, CardTier, TutorialStep, ProgressionReward } from './types';
 import { auth, db, googleProvider, signInWithPopup, signOut, onAuthStateChanged } from './firebase';
 import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
+import { PROGRESSION_REWARDS } from './data/progression';
 
 // --- 3D Game Constants ---
 const GRAVITY = -9.81;
@@ -27,6 +28,14 @@ const RIM_THICKNESS = 0.02;
 const HOOP_POS = new THREE.Vector3(0, 3.05, -4.6);
 const BACKBOARD_POS = new THREE.Vector3(0, 3.5, -5.1);
 const BACKBOARD_SIZE = new THREE.Vector3(1.8, 1.2, 0.05);
+
+const CONTEST_POSITIONS: [number, number, number][] = [
+  [-6, 0, -2], // Left Corner
+  [-4, 0, -4.5], // Left Wing
+  [0, 0, -6], // Top of Key
+  [4, 0, -4.5], // Right Wing
+  [6, 0, -2], // Right Corner
+];
 
 // --- 3D Components ---
 
@@ -81,19 +90,23 @@ function ShotMeter({ power, isShot, isGreen, coverage }: { power: number, isShot
   );
 }
 
-function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos }: { 
+function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, isDribbling, dribbleType, onBallUpdate }: { 
   isShot: boolean, 
   velocity: THREE.Vector3, 
   onReset: () => void,
   onScore: () => void,
   isGreen: boolean,
-  initialPos: [number, number, number]
+  initialPos: [number, number, number],
+  isDribbling?: boolean,
+  dribbleType?: string | null,
+  onBallUpdate?: (pos: THREE.Vector3, isReboundable: boolean) => void
 }) {
   const meshRef = useRef<THREE.Mesh>(null);
   const pos = useRef(new THREE.Vector3(...initialPos));
   const vel = useRef(new THREE.Vector3(0, 0, 0));
   const angVel = useRef(new THREE.Vector3(0, 0, 0));
   const [scored, setScored] = useState(false);
+  const [hasHitRim, setHasHitRim] = useState(false);
 
   useEffect(() => {
     if (isShot) {
@@ -101,53 +114,114 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos }:
       // Add backspin on shot
       angVel.current.set(-15, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 2);
       setScored(false);
-    } else {
+      setHasHitRim(false);
+    } else if (!isDribbling) {
       pos.current.set(...initialPos);
       vel.current.set(0, 0, 0);
       angVel.current.set(0, 0, 0);
+      setHasHitRim(false);
     }
-  }, [isShot, velocity, initialPos]);
+  }, [isShot, velocity, initialPos, isDribbling]);
 
   useFrame((state, delta) => {
-    if (!isShot || !meshRef.current) return;
+    if (!meshRef.current) return;
+
+    if (onBallUpdate) {
+      // Ball is reboundable if it's in the air after a shot and hasn't scored
+      // Or if it hit the rim/backboard
+      const isReboundable = isShot && !scored && pos.current.y > 1.0 && pos.current.y < 4.5;
+      onBallUpdate(pos.current, isReboundable);
+    }
+
+    if (isDribbling && !isShot) {
+      const time = state.clock.getElapsedTime() * 15;
+      const playerX = initialPos[0];
+      const playerY = initialPos[1] + 0.8;
+      const playerZ = initialPos[2];
+
+      let targetX = playerX + 0.5;
+      let targetY = playerY + Math.sin(time) * 0.4;
+      let targetZ = playerZ + 0.3;
+
+      if (dribbleType === 'Crossover') {
+        targetX = playerX + Math.sin(time) * 0.8;
+        targetY = playerY + Math.abs(Math.cos(time)) * 0.3;
+      } else if (dribbleType === 'Behind the Back') {
+        targetX = playerX + Math.sin(time) * 0.6;
+        targetZ = playerZ - 0.4;
+      } else if (dribbleType === 'Between the Legs') {
+        targetX = playerX + Math.sin(time) * 0.4;
+        targetZ = playerZ + Math.cos(time) * 0.6;
+      }
+
+      pos.current.lerp(new THREE.Vector3(targetX, targetY, targetZ), 0.2);
+      meshRef.current.position.copy(pos.current);
+      meshRef.current.rotation.x += delta * 10;
+      return;
+    }
+
+    if (!isShot) {
+      // Idle bounce
+      const time = state.clock.getElapsedTime() * 8;
+      pos.current.set(initialPos[0] + 0.5, initialPos[1] + 0.8 + Math.sin(time) * 0.3, initialPos[2] + 0.3);
+      meshRef.current.position.copy(pos.current);
+      meshRef.current.rotation.x += delta * 2;
+      return;
+    }
 
     // 1. Gravity
     vel.current.y += GRAVITY * delta;
 
-    // 2. Air Resistance (Drag)
+    // 2. Magnus Effect (Spin Influence on Flight)
+    // Backspin creates lift, sidespin creates curve
+    const magnusCoefficient = 0.08;
+    const magnusForce = new THREE.Vector3()
+      .crossVectors(angVel.current, vel.current)
+      .multiplyScalar(magnusCoefficient * delta);
+    vel.current.add(magnusForce);
+
+    // 3. Air Resistance (Drag)
     const dragForce = vel.current.clone().multiplyScalar(-DRAG * vel.current.length() * delta);
     vel.current.add(dragForce);
 
-    // 3. Update Position
+    // 4. Update Position
     pos.current.add(vel.current.clone().multiplyScalar(delta));
     
-    // 4. Update Rotation (Visual and Physics)
+    // 5. Update Rotation (Visual and Physics)
     meshRef.current.position.copy(pos.current);
     meshRef.current.rotation.x += angVel.current.x * delta;
     meshRef.current.rotation.y += angVel.current.y * delta;
     meshRef.current.rotation.z += angVel.current.z * delta;
 
-    // 5. Collision with ground
+    // 6. Collision with ground
     if (pos.current.y < BALL_RADIUS) {
       pos.current.y = BALL_RADIUS;
       
-      // Bounce with spin influence
+      // Bounce with energy loss
       vel.current.y *= -RESTITUTION;
       
-      // Spin affects horizontal velocity on bounce
-      vel.current.x += angVel.current.z * SPIN_BOUNCE_FACTOR;
-      vel.current.z -= angVel.current.x * SPIN_BOUNCE_FACTOR;
+      // Spin-to-Linear velocity transfer (Friction)
+      const frictionCoefficient = 0.35;
+      const surfaceVel = new THREE.Vector3(
+        vel.current.x + angVel.current.z * BALL_RADIUS,
+        0,
+        vel.current.z - angVel.current.x * BALL_RADIUS
+      );
       
-      // Ground friction
+      vel.current.x -= surfaceVel.x * frictionCoefficient;
+      vel.current.z -= surfaceVel.z * frictionCoefficient;
+      
+      // Linear-to-Spin velocity transfer
+      angVel.current.x += surfaceVel.z * frictionCoefficient * 2;
+      angVel.current.z -= surfaceVel.x * frictionCoefficient * 2;
+      
+      // Damping
       vel.current.x *= FRICTION;
       vel.current.z *= FRICTION;
-      
-      // Ground affects spin
-      angVel.current.x *= 0.8;
-      angVel.current.z *= 0.8;
+      angVel.current.multiplyScalar(0.85);
     }
 
-    // 6. Collision with Backboard
+    // 7. Collision with Backboard
     const bbMin = BACKBOARD_POS.clone().sub(BACKBOARD_SIZE.clone().multiplyScalar(0.5));
     const bbMax = BACKBOARD_POS.clone().add(BACKBOARD_SIZE.clone().multiplyScalar(0.5));
     
@@ -156,21 +230,41 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos }:
         pos.current.z > bbMin.z - BALL_RADIUS && pos.current.z < bbMax.z + BALL_RADIUS) {
       
       if (Math.abs(pos.current.z - BACKBOARD_POS.z) < BALL_RADIUS + 0.05) {
+        // Reflect Z
         vel.current.z *= -RESTITUTION;
         pos.current.z = BACKBOARD_POS.z + BALL_RADIUS + 0.06;
-        angVel.current.add(new THREE.Vector3(Math.random() * 10, Math.random() * 10, 0));
+        
+        // Spin influence on backboard (kick)
+        vel.current.x += angVel.current.y * 0.1;
+        vel.current.y += angVel.current.x * 0.1;
+        
+        // Add some random rattle
+        angVel.current.add(new THREE.Vector3((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10));
       }
     }
 
-    // 7. Collision with Rim
+    // 8. Collision with Rim (Improved)
     const distToHoopCenter = new THREE.Vector2(pos.current.x - HOOP_POS.x, pos.current.z - HOOP_POS.z).length();
     const heightDiff = Math.abs(pos.current.y - HOOP_POS.y);
 
     if (heightDiff < BALL_RADIUS && Math.abs(distToHoopCenter - RIM_RADIUS) < BALL_RADIUS) {
       const normal = pos.current.clone().sub(HOOP_POS).normalize();
-      vel.current.reflect(normal).multiplyScalar(RESTITUTION);
+      
+      // Reflect with spin influence
+      const dot = vel.current.dot(normal);
+      vel.current.sub(normal.clone().multiplyScalar(2 * dot));
+      vel.current.multiplyScalar(RESTITUTION);
+      
+      // Rim "grab" based on spin
+      const rimFriction = 0.2;
+      vel.current.x += angVel.current.z * rimFriction;
+      vel.current.z -= angVel.current.x * rimFriction;
+      
+      // Jitter for rim springiness
+      vel.current.add(new THREE.Vector3((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5));
+      
       pos.current.add(normal.multiplyScalar(0.05));
-      angVel.current.multiplyScalar(0.5);
+      angVel.current.multiplyScalar(0.6);
     }
 
     // 8. Scoring logic
@@ -271,24 +365,50 @@ function BroadcastScoreboard({ score, gameClock, shotClock, teamName }: { score:
   );
 }
 
-function PlayerIndicator({ position, stamina, takeoverMeter, isTakeoverActive }: { position: [number, number, number], stamina: number, takeoverMeter: number, isTakeoverActive: boolean }) {
+function PlayerIndicator({ position, stamina, takeoverMeter, isTakeoverActive, isFading, isDribbling }: { 
+  position: [number, number, number], 
+  stamina: number, 
+  takeoverMeter: number, 
+  isTakeoverActive: boolean, 
+  isFading?: boolean,
+  isDribbling?: boolean
+}) {
   return (
     <group position={position}>
       {/* Circle on ground */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.01, 0]}>
         <ringGeometry args={[0.5, 0.6, 32]} />
-        <meshBasicMaterial color={isTakeoverActive ? "#ce1141" : "white"} transparent opacity={0.6} />
+        <meshBasicMaterial 
+          color={isDribbling ? "#ce1141" : isTakeoverActive ? "#ce1141" : "white"} 
+          transparent 
+          opacity={isDribbling ? 0.9 : 0.6} 
+        />
       </mesh>
       
-      {/* Stamina Bar */}
-      <mesh position={[0, 0.02, 0.7]} rotation={[-Math.PI / 2, 0, 0]}>
-        <planeGeometry args={[1, 0.05]} />
-        <meshBasicMaterial color="black" transparent opacity={0.4} />
-      </mesh>
-      <mesh position={[-(1 - stamina/100)/2, 0.021, 0.7]} rotation={[-Math.PI / 2, 0, 0]}>
-        <planeGeometry args={[stamina / 100, 0.05]} />
-        <meshBasicMaterial color={stamina < 30 ? "#ce1141" : "#4ade80"} />
-      </mesh>
+      {/* Floating Stamina Bar Above Head */}
+      <group position={[0, 2.2, 0]}>
+        {/* Background */}
+        <mesh>
+          <planeGeometry args={[0.8, 0.04]} />
+          <meshBasicMaterial color="black" transparent opacity={0.5} />
+        </mesh>
+        {/* Fill */}
+        <mesh position={[-(0.8 * (1 - stamina/100)) / 2, 0, 0.001]}>
+          <planeGeometry args={[0.8 * (stamina / 100), 0.04]} />
+          <meshBasicMaterial color={stamina < 30 ? "#ce1141" : "#4ade80"} />
+        </mesh>
+        {/* Label */}
+        <Text
+          position={[0, 0.1, 0]}
+          fontSize={0.08}
+          color={isFading ? "#ce1141" : "white"}
+          font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuGkyMZhrib2Bg-4.ttf"
+          anchorX="center"
+          anchorY="middle"
+        >
+          {isFading ? "FADEAWAY" : "STAMINA"}
+        </Text>
+      </group>
       
       {/* Takeover Icon */}
       {takeoverMeter > 50 && (
@@ -307,9 +427,81 @@ function PlayerIndicator({ position, stamina, takeoverMeter, isTakeoverActive }:
     </group>
   );
 }
-function Defender({ position }: { position: [number, number, number] }) {
+function Defender({ initialPosition, playerPos, isDribbling, dribbleCombo, isBroken, isReboundable, ballPos, isJumping }: { 
+  initialPosition: [number, number, number], 
+  playerPos: [number, number, number],
+  isDribbling?: boolean,
+  dribbleCombo?: number,
+  isBroken?: boolean,
+  isReboundable?: boolean,
+  ballPos?: THREE.Vector3,
+  isJumping?: boolean
+}) {
+  const groupRef = useRef<THREE.Group>(null);
+  const currentPos = useRef(new THREE.Vector3(...initialPosition));
+
+  useFrame((state, delta) => {
+    if (!groupRef.current) return;
+
+    if (isBroken) {
+      // Stumble animation
+      groupRef.current.rotation.x = Math.sin(state.clock.elapsedTime * 10) * 0.5;
+      groupRef.current.position.y = -0.2;
+      return;
+    }
+
+    // Jumping animation
+    if (isJumping) {
+      groupRef.current.position.y = Math.sin(state.clock.elapsedTime * 10) * 0.5 + 0.5;
+    } else {
+      groupRef.current.position.y = Math.sin(state.clock.elapsedTime * 5) * 0.05;
+    }
+
+    let targetPos = new THREE.Vector3(...playerPos);
+    
+    // If ball is reboundable, move towards ball instead of player
+    if (isReboundable && ballPos) {
+      targetPos.copy(ballPos);
+      targetPos.y = 0; // Stay on ground
+    }
+
+    const dist = currentPos.current.distanceTo(targetPos);
+    
+    // Defensive logic: stay between player and hoop (0, 0, -4.6)
+    // But for simplicity, just move towards player if they are close
+    if ((dist < 7 && dist > 1.0) || (isReboundable && dist > 0.5)) {
+      const direction = new THREE.Vector3().subVectors(targetPos, currentPos.current).normalize();
+      // Only move on X and Z
+      direction.y = 0;
+      
+      // Smooth movement
+      const speed = isReboundable ? 4.0 : 2.5; // Move faster for rebounds
+      currentPos.current.add(direction.multiplyScalar(delta * speed));
+      groupRef.current.position.x = currentPos.current.x;
+      groupRef.current.position.z = currentPos.current.z;
+      
+      // Look at target
+      groupRef.current.lookAt(targetPos.x, currentPos.current.y, targetPos.z);
+    } else if (dist <= 1.0) {
+      // Look at target even when standing still
+      groupRef.current.lookAt(targetPos.x, currentPos.current.y, targetPos.z);
+    }
+  });
+
   return (
-    <group position={position}>
+    <group ref={groupRef} position={initialPosition}>
+      {isBroken && (
+        <Text
+          position={[0, 2.2, 0]}
+          fontSize={0.2}
+          color="#ce1141"
+          font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+          anchorX="center"
+          anchorY="middle"
+        >
+          BROKEN!
+        </Text>
+      )}
       {/* Body */}
       <mesh position={[0, 1, 0]} castShadow>
         <capsuleGeometry args={[0.4, 1.2, 4, 8]} />
@@ -343,6 +535,48 @@ function Defender({ position }: { position: [number, number, number] }) {
         <ringGeometry args={[0.5, 0.6, 32]} />
         <meshBasicMaterial color="#ce1141" transparent opacity={0.4} />
       </mesh>
+    </group>
+  );
+}
+
+function BallRack({ position, active }: { position: [number, number, number], active: boolean }) {
+  // Calculate rotation to face the hoop (0, 0, -4.6)
+  const hoopPos = new THREE.Vector3(0, 0, -4.6);
+  const rackPos = new THREE.Vector3(...position);
+  const angle = Math.atan2(hoopPos.x - rackPos.x, hoopPos.z - rackPos.z);
+
+  return (
+    <group position={position} rotation={[0, angle, 0]}>
+      {/* Base */}
+      <mesh position={[0, 0.1, 0]}>
+        <boxGeometry args={[1, 0.2, 0.5]} />
+        <meshStandardMaterial color={active ? "#ce1141" : "#333"} />
+      </mesh>
+      {/* Rails */}
+      <mesh position={[0, 0.8, 0.2]}>
+        <boxGeometry args={[1, 0.05, 0.05]} />
+        <meshStandardMaterial color="#555" />
+      </mesh>
+      <mesh position={[0, 0.8, -0.2]}>
+        <boxGeometry args={[1, 0.05, 0.05]} />
+        <meshStandardMaterial color="#555" />
+      </mesh>
+      {/* Support */}
+      <mesh position={[0.4, 0.4, 0]}>
+        <boxGeometry args={[0.05, 0.8, 0.4]} />
+        <meshStandardMaterial color="#444" />
+      </mesh>
+      <mesh position={[-0.4, 0.4, 0]}>
+        <boxGeometry args={[0.05, 0.8, 0.4]} />
+        <meshStandardMaterial color="#444" />
+      </mesh>
+      {/* Balls on rack */}
+      {[...Array(5)].map((_, i) => (
+        <mesh key={i} position={[(i - 2) * 0.18, 0.9, 0]}>
+          <sphereGeometry args={[0.12, 16, 16]} />
+          <meshStandardMaterial color={i === 4 ? "#f58220" : "#ce1141"} />
+        </mesh>
+      ))}
     </group>
   );
 }
@@ -594,9 +828,70 @@ function Stadium() {
   );
 }
 
-function PlayerModel({ player, position }: { player: PlayerType, position: [number, number, number] }) {
+function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }: { 
+  player: PlayerType, 
+  position: [number, number, number], 
+  isFading?: boolean,
+  dribbleAnimation?: string | null,
+  isJumping?: boolean
+}) {
+  const groupRef = useRef<THREE.Group>(null);
+  const meshRef = useRef<THREE.Mesh>(null);
+  
+  useFrame((state, delta) => {
+    if (groupRef.current) {
+      // Always face the basket
+      const basketPos = new THREE.Vector3(0, 0, -4.6);
+      groupRef.current.lookAt(basketPos.x, groupRef.current.position.y, basketPos.z);
+
+      // Jump Animation
+      if (isJumping) {
+        groupRef.current.position.y = Math.sin(state.clock.elapsedTime * 10) * 0.5 + 0.5;
+        return;
+      }
+
+      // Fadeaway Animation
+      const targetRotationX = isFading ? 0.4 : 0;
+      groupRef.current.rotation.x = THREE.MathUtils.lerp(groupRef.current.rotation.x, targetRotationX, 0.1);
+      
+      const targetY = isFading ? 0.2 : 0;
+      groupRef.current.position.y = THREE.MathUtils.lerp(groupRef.current.position.y, targetY, 0.1);
+
+      // Dribble Animations
+      if (dribbleAnimation) {
+        const time = state.clock.getElapsedTime() * 10;
+        switch(dribbleAnimation) {
+          case 'Crossover':
+            groupRef.current.rotation.z = Math.sin(time) * 0.3;
+            groupRef.current.position.x += Math.cos(time) * 0.1;
+            break;
+          case 'Between the Legs':
+            groupRef.current.position.y += Math.abs(Math.sin(time)) * 0.15;
+            groupRef.current.rotation.x = 0.3;
+            break;
+          case 'Behind the Back':
+            groupRef.current.rotation.y = Math.sin(time) * 0.8;
+            groupRef.current.position.z += Math.cos(time) * 0.05;
+            break;
+          case 'Spin':
+            groupRef.current.rotation.y += 0.8;
+            break;
+          case 'Step Back':
+            groupRef.current.rotation.x = -0.3;
+            groupRef.current.position.z += 0.05;
+            break;
+        }
+      } else if (!isFading) {
+        // Reset rotations smoothly
+        groupRef.current.rotation.z = THREE.MathUtils.lerp(groupRef.current.rotation.z, 0, 0.1);
+        groupRef.current.rotation.y = THREE.MathUtils.lerp(groupRef.current.rotation.y, 0, 0.1);
+        groupRef.current.rotation.x = THREE.MathUtils.lerp(groupRef.current.rotation.x, 0, 0.1);
+      }
+    }
+  });
+
   return (
-    <group position={position}>
+    <group ref={groupRef} position={[position[0], position[1], position[2]]}>
       {/* Simple Stylized Player */}
       <mesh position={[0, 0.9, 0]} castShadow>
         <capsuleGeometry args={[0.3, 1, 4, 8]} />
@@ -806,6 +1101,84 @@ function TutorialOverlay({ steps, onComplete }: { steps: TutorialStep[], onCompl
   );
 }
 
+function Joystick({ onMove }: { onMove: (dir: {x: number, y: number} | null) => void }) {
+  const [isDragging, setIsDragging] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const handleStart = (e: React.TouchEvent | React.MouseEvent) => {
+    setIsDragging(true);
+    handleMove(e);
+  };
+
+  const handleMove = (e: React.TouchEvent | React.MouseEvent) => {
+    if (!isDragging || !containerRef.current) return;
+    
+    const rect = containerRef.current.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    
+    let clientX, clientY;
+    if ('touches' in e) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else {
+      clientX = (e as React.MouseEvent).clientX;
+      clientY = (e as React.MouseEvent).clientY;
+    }
+
+    const dx = clientX - centerX;
+    const dy = clientY - centerY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    const maxRadius = rect.width / 2;
+    
+    const limitedDistance = Math.min(distance, maxRadius);
+    const angle = Math.atan2(dy, dx);
+    
+    const x = Math.cos(angle) * limitedDistance;
+    const y = Math.sin(angle) * limitedDistance;
+    
+    setPos({ x, y });
+    onMove({ x: x / maxRadius, y: y / maxRadius });
+  };
+
+  const handleEnd = () => {
+    setIsDragging(false);
+    setPos({ x: 0, y: 0 });
+    onMove(null);
+  };
+
+  useEffect(() => {
+    if (isDragging) {
+      window.addEventListener('mousemove', handleMove as any);
+      window.addEventListener('mouseup', handleEnd);
+      window.addEventListener('touchmove', handleMove as any, { passive: false });
+      window.addEventListener('touchend', handleEnd);
+    }
+    return () => {
+      window.removeEventListener('mousemove', handleMove as any);
+      window.removeEventListener('mouseup', handleEnd);
+      window.removeEventListener('touchmove', handleMove as any);
+      window.removeEventListener('touchend', handleEnd);
+    };
+  }, [isDragging]);
+
+  return (
+    <div 
+      ref={containerRef}
+      onMouseDown={handleStart}
+      onTouchStart={handleStart}
+      className="w-32 h-32 rounded-full bg-black/40 backdrop-blur-md border-2 border-white/20 relative flex items-center justify-center touch-none"
+    >
+      <motion.div 
+        animate={{ x: pos.x, y: pos.y }}
+        transition={{ type: 'spring', damping: 20, stiffness: 300 }}
+        className="w-12 h-12 rounded-full bg-white/60 shadow-xl"
+      />
+    </div>
+  );
+}
+
 // --- Main App Component ---
 
 export default function App() {
@@ -814,9 +1187,12 @@ export default function App() {
   const [highScore, setHighScore] = useState(0);
   const [vc, setVc] = useState(1500); // Starting VC
   const [isShot, setIsShot] = useState(false);
+  const [isFading, setIsFading] = useState(false);
   const [isCharging, setIsCharging] = useState(false);
+  const [isChargingFade, setIsChargingFade] = useState(false);
   const [isGreen, setIsGreen] = useState(false);
   const [shotCoverage, setShotCoverage] = useState(0);
+
   const [playerPos, setPlayerPos] = useState<[number, number, number]>([0, 0, 5.5]);
   const [shotVelocity, setShotVelocity] = useState(new THREE.Vector3(0, 0, 0));
   const [power, setPower] = useState(0);
@@ -824,6 +1200,17 @@ export default function App() {
   const [shotMeterSensitivity, setShotMeterSensitivity] = useState(1.0);
   const [isDribbling, setIsDribbling] = useState(false);
   const [dribbleType, setDribbleType] = useState<string | null>(null);
+  const [dribbleAnimation, setDribbleAnimation] = useState<string | null>(null);
+  const [dribbleCombo, setDribbleCombo] = useState(0);
+  const [lastDribbleTime, setLastDribbleTime] = useState(0);
+  const [isDefenderBroken, setIsDefenderBroken] = useState(false);
+  
+  // --- Rebounding States ---
+  const [isReboundable, setIsReboundable] = useState(false);
+  const [ballPos, setBallPos] = useState(new THREE.Vector3(0, 0, 0));
+  const [isJumping, setIsJumping] = useState(false);
+  const [reboundMessage, setReboundMessage] = useState<string | null>(null);
+  const [isDefenderJumping, setIsDefenderJumping] = useState(false);
   
   // --- Game HUD States ---
   const [shotClock, setShotClock] = useState(24);
@@ -831,6 +1218,85 @@ export default function App() {
   const [stamina, setStamina] = useState(100);
   const [takeoverMeter, setTakeoverMeter] = useState(0);
   const [isTakeoverActive, setIsTakeoverActive] = useState(false);
+
+  const [keys, setKeys] = useState<Record<string, boolean>>({});
+  const [joystickDir, setJoystickDir] = useState<{x: number, y: number} | null>(null);
+
+  // --- Keyboard Listeners ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      setKeys(prev => ({ ...prev, [e.key.toLowerCase()]: true }));
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      setKeys(prev => ({ ...prev, [e.key.toLowerCase()]: false }));
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  // --- Movement Loop ---
+  useEffect(() => {
+    if (view !== 'game') return;
+    let lastTime = Date.now();
+    let frameId: number;
+
+    const moveLoop = () => {
+      const now = Date.now();
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+
+      if (!isShot && stamina > 0) {
+        let dx = 0;
+        let dz = 0;
+
+        // Keyboard
+        if (keys['w'] || keys['arrowup']) dz -= 1;
+        if (keys['s'] || keys['arrowdown']) dz += 1;
+        if (keys['a'] || keys['arrowleft']) dx -= 1;
+        if (keys['d'] || keys['arrowright']) dx += 1;
+
+        // Joystick
+        if (joystickDir) {
+          dx += joystickDir.x;
+          dz += joystickDir.y;
+        }
+
+        if (dx !== 0 || dz !== 0) {
+          const speed = isDribbling ? 6 : 5; // Faster while dribbling
+          const length = Math.sqrt(dx * dx + dz * dz);
+          dx /= length;
+          dz /= length;
+
+          setPlayerPos(prev => {
+            const newX = prev[0] + dx * speed * dt;
+            const newZ = prev[2] + dz * speed * dt;
+            
+            // Court boundaries (roughly)
+            const clampedX = Math.max(-10, Math.min(10, newX));
+            const clampedZ = Math.max(-10, Math.min(10, newZ));
+            
+            const newPos: [number, number, number] = [clampedX, prev[1], clampedZ];
+
+            // Adjust angle based on distance
+            const dist = new THREE.Vector3(0, 0, -4.6).distanceTo(new THREE.Vector3(...newPos));
+            setAngle(dist > 10 ? 35 : 45);
+
+            return newPos;
+          });
+          
+          // Stamina drain
+          setStamina(prev => Math.max(0, prev - (0.1 * (isDribbling ? 2 : 1))));
+        }
+      }
+      frameId = requestAnimationFrame(moveLoop);
+    };
+    frameId = requestAnimationFrame(moveLoop);
+    return () => cancelAnimationFrame(frameId);
+  }, [view, keys, joystickDir, isShot, stamina, isDribbling]);
   
   // --- Tutorial States ---
   const [activeTutorial, setActiveTutorial] = useState<TutorialStep[] | null>(null);
@@ -851,6 +1317,11 @@ export default function App() {
       {
         title: "The City",
         description: "Explore the City to find pickup games, training facilities, and more. Your journey starts here.",
+        position: "center"
+      },
+      {
+        title: "Signature Dribbling",
+        description: "Chain together crossovers, spins, and behind-the-back moves to break your defender's ankles. High combos fill your Takeover meter faster!",
         position: "center"
       }
     ] as TutorialStep[],
@@ -912,54 +1383,147 @@ export default function App() {
     return () => clearInterval(timer);
   }, [view]);
 
+  // --- Rebounding Logic ---
+  const handleBallUpdate = (pos: THREE.Vector3, reboundable: boolean) => {
+    setBallPos(pos.clone());
+    setIsReboundable(reboundable);
+  };
+
+  const handleJump = () => {
+    if (isJumping || stamina < 15 || isShot) return;
+    
+    setIsJumping(true);
+    setStamina(prev => Math.max(0, prev - 15));
+    
+    // Check for rebound
+    if (isReboundable) {
+      const dist = new THREE.Vector3(playerPos[0], 2.0, playerPos[2]).distanceTo(ballPos);
+      const reboundingStat = activePlayer.stats.rebounding || 80;
+      
+      // Timing and distance check
+      if (dist < 2.5) {
+        // Success chance based on stat
+        if (Math.random() * 100 < reboundingStat) {
+          handleReboundSuccess(true);
+        } else {
+          setReboundMessage("Missed Rebound!");
+          setTimeout(() => setReboundMessage(null), 1500);
+        }
+      }
+    }
+    
+    setTimeout(() => setIsJumping(false), 800);
+  };
+
+  const handleReboundSuccess = (isOffensive: boolean) => {
+    setIsShot(false);
+    setShotClock(24);
+    setReboundMessage(isOffensive ? "OFFENSIVE REBOUND!" : "DEFENSIVE REBOUND!");
+    addLog(`${activePlayer.name} grabs the ${isOffensive ? 'offensive' : 'defensive'} board!`);
+    
+    // Reset ball to player hands
+    setPlayerPos([playerPos[0], playerPos[1], playerPos[2]]);
+    
+    setTimeout(() => setReboundMessage(null), 2000);
+  };
+
+  // --- Defender Rebounding AI ---
+  useEffect(() => {
+    if (isReboundable && !isDefenderJumping && Math.random() < 0.05) {
+      // Defender jumps for rebound if close to ball
+      // (Positioning logic is in Defender component)
+      setIsDefenderJumping(true);
+      setTimeout(() => {
+        setIsDefenderJumping(false);
+        // If defender wins rebound
+        if (isReboundable && Math.random() < 0.3) {
+          setIsShot(false);
+          setShotClock(24);
+          setReboundMessage("DEFENDER REBOUND!");
+          addLog("Defender grabs the board!");
+          setPlayerPos([0, 0, 5.5]); // Reset player
+          setTimeout(() => setReboundMessage(null), 2000);
+        }
+      }, 800);
+    }
+  }, [isReboundable, isDefenderJumping]);
+
   // --- Power Charging Logic ---
   useEffect(() => {
     let interval: any;
-    if (isCharging && !isShot) {
+    if ((isCharging || isChargingFade) && !isShot) {
       interval = setInterval(() => {
         setPower(p => {
-          const next = p + 0.025;
+          const next = p + (0.025 * shotMeterSensitivity);
           return next > 1 ? 0 : next;
         });
       }, 20);
-    } else if (!isCharging && !isShot) {
+    } else if (!isCharging && !isChargingFade && !isShot) {
       // Keep power for a moment or reset? 
       // Usually we reset after shot
     }
     return () => clearInterval(interval);
-  }, [isCharging, isShot]);
+  }, [isCharging, isChargingFade, isShot, shotMeterSensitivity]);
 
-  const movePlayer = () => {
-    if (isShot) return;
-    const spots: [number, number, number][] = [
-      [0, 0, 5.5],    // Top of key
-      [-4, 0, 4.5],   // Left wing
-      [4, 0, 4.5],    // Right wing
-      [-6, 0, 3],     // Left corner
-      [6, 0, 3],      // Right corner
-      [0, 0, 8.5],    // Deep 3
-    ];
-    // Cycle through spots
-    const currentIndex = spots.findIndex(s => s[0] === playerPos[0] && s[2] === playerPos[2]);
-    const nextIndex = (currentIndex + 1) % spots.length;
-    setPlayerPos(spots[nextIndex]);
-    
-    // Adjust angle based on distance
-    const dist = new THREE.Vector3(0, 0, -4.6).distanceTo(new THREE.Vector3(...spots[nextIndex]));
-    setAngle(dist > 10 ? 35 : 45);
-    
-    handleReset();
-    addLog(`Moved to ${dist > 10 ? 'Deep Range' : 'Shooting Spot'}`);
-  };
-
-  // --- Mobile Dribble Logic ---
+  // --- Dribble Combo Reset ---
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (Date.now() - lastDribbleTime > 2000 && dribbleCombo > 0) {
+        setDribbleCombo(0);
+      }
+    }, 500);
+    return () => clearInterval(timer);
+  }, [lastDribbleTime, dribbleCombo]);
   const performDribble = (move: string) => {
-    if (isShot || stamina < 5) return;
+    if (isShot || stamina < 10) return;
+    
+    const now = Date.now();
+    const isCombo = now - lastDribbleTime < 1500;
+    const newCombo = isCombo ? dribbleCombo + 1 : 1;
+    
+    setDribbleCombo(newCombo);
+    setLastDribbleTime(now);
     setIsDribbling(true);
     setDribbleType(move);
-    addLog(`${activePlayer.name} performs a ${move}!`);
-    setStamina(prev => Math.max(0, prev - 5));
-    setTimeout(() => setIsDribbling(false), 500);
+    setDribbleAnimation(move);
+    
+    // Signature Move Effects
+    switch(move) {
+      case 'Step Back':
+        setPlayerPos(prev => [prev[0], prev[1], prev[2] + 1.2]);
+        break;
+      case 'Crossover':
+        setPlayerPos(prev => [prev[0] + (Math.random() > 0.5 ? 1 : -1), prev[1], prev[2]]);
+        break;
+      case 'Spin':
+        setPlayerPos(prev => [prev[0], prev[1], prev[2] - 0.5]); // Slight forward burst
+        break;
+    }
+
+    // Check for ankle breaker
+    const playmakingStat = activePlayer.stats.playmaking || 80;
+    const breakChance = (playmakingStat / 100) * (newCombo * 0.05);
+    if (Math.random() < breakChance && !isDefenderBroken) {
+      addLog(`ANKLE BREAKER! ${activePlayer.name} drops the defender!`);
+      setTakeoverMeter(prev => Math.min(100, prev + 10));
+      setIsDefenderBroken(true);
+      setTimeout(() => setIsDefenderBroken(false), 2000);
+    }
+
+    addLog(`${activePlayer.name} performs a ${move}! ${newCombo > 1 ? `COMBO x${newCombo}` : ''}`);
+    
+    // Stamina cost increases with combo
+    const staminaCost = 8 + (newCombo * 2);
+    setStamina(prev => Math.max(0, prev - staminaCost));
+    
+    // Boost takeover for successful moves, scaled by playmaking stat
+    const playmakingFactor = (activePlayer.stats.playmaking || 80) / 100;
+    setTakeoverMeter(prev => Math.min(100, prev + (2 * newCombo * playmakingFactor)));
+    
+    setTimeout(() => {
+      setIsDribbling(false);
+      setDribbleAnimation(null);
+    }, 600);
   };
 
   // --- Firebase Auth State ---
@@ -988,8 +1552,134 @@ export default function App() {
   const [show67Meme, setShow67Meme] = useState(false);
   const [gameLog, setGameLog] = useState<string[]>([]);
 
+  // --- 3-Point Contest State ---
+  const [is3PointContest, setIs3PointContest] = useState(false);
+  const [contestScore, setContestScore] = useState(0);
+  const [contestTime, setContestTime] = useState(60);
+  const [contestRack, setContestRack] = useState(0); // 0-4 racks
+  const [contestBall, setContestBall] = useState(0); // 0-4 balls per rack
+  const [contestHighScore, setContestHighScore] = useState(0);
+  const [contestStatus, setContestStatus] = useState<'idle' | 'playing' | 'finished'>('idle');
+  const [careerTab, setCareerTab] = useState<'attributes' | 'progression' | 'inventory'>('attributes');
+
+  // 3-Point Contest Timer
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (is3PointContest && contestStatus === 'playing' && contestTime > 0) {
+      timer = setInterval(() => {
+        setContestTime(t => {
+          if (t <= 1) {
+            setContestStatus('finished');
+            return 0;
+          }
+          return t - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [is3PointContest, contestStatus, contestTime]);
+
+  // Handle Contest Completion Rewards
+  useEffect(() => {
+    if (contestStatus === 'finished') {
+      const vcReward = contestScore * 10;
+      const xpReward = contestScore * 20;
+      
+      addCareerXP(xpReward, vcReward);
+      
+      addLog(`Contest Final Score: ${contestScore}`);
+      addLog(`Contest Reward: ${vcReward} VC, ${xpReward} XP!`);
+      
+      if (contestScore > contestHighScore) {
+        setContestHighScore(contestScore);
+        addLog(`NEW HIGH SCORE!`);
+      }
+    }
+  }, [contestStatus]);
+
+  // Update player position during contest
+  useEffect(() => {
+    if (is3PointContest && contestStatus === 'playing') {
+      setPlayerPos(CONTEST_POSITIONS[contestRack]);
+    }
+  }, [is3PointContest, contestStatus, contestRack]);
+
   const addLog = (message: string) => {
     setGameLog(prev => [message, ...prev].slice(0, 5));
+  };
+
+  const addCareerXP = (amount: number, vcAmount: number = 0) => {
+    if (!careerPlayer) return;
+    
+    if (vcAmount > 0) {
+      setVc(prev => prev + vcAmount);
+    }
+    
+    setCareerPlayer(prev => {
+      if (!prev) return null;
+      
+      let newXP = prev.xp + amount;
+      let newLevel = prev.level;
+      const newInventory = [...prev.inventory];
+      const newEndorsements = [...prev.endorsements];
+      const newBadges = [...prev.badges];
+      
+      // Level up logic
+      while (newXP >= 1000) {
+        newXP -= 1000;
+        newLevel += 1;
+        
+        // Check for rewards at this new level
+        const rewards = PROGRESSION_REWARDS.filter(r => r.level === newLevel);
+        rewards.forEach(reward => {
+          addLog(`UNLOCKED: ${reward.name}!`);
+          
+          if (reward.type === 'Animation' || reward.type === 'Signature Move') {
+            newInventory.push({
+              id: reward.id,
+              name: reward.name,
+              type: reward.type as any,
+              equipped: false
+            });
+          } else if (reward.type === 'Endorsement') {
+            newEndorsements.push({
+              brand: reward.name,
+              status: 'Active',
+              bonus: reward.description
+            });
+          } else if (reward.type === 'Badge') {
+            newBadges.push({
+              name: reward.name,
+              level: 'Bronze',
+              description: reward.description,
+              category: 'Shooting'
+            });
+          }
+        });
+      }
+      
+      return {
+        ...prev,
+        xp: newXP,
+        level: newLevel,
+        inventory: newInventory,
+        endorsements: newEndorsements,
+        badges: newBadges
+      };
+    });
+  };
+
+  const toggleInventoryItem = (id: string) => {
+    setCareerPlayer(prev => {
+      if (!prev) return null;
+      const newInventory = prev.inventory.map(item => {
+        if (item.id === id) {
+          return { ...item, equipped: !item.equipped };
+        }
+        return item;
+      });
+      return { ...prev, inventory: newInventory };
+    });
   };
 
   const INFINITE_VC = 999999999;
@@ -1247,6 +1937,7 @@ export default function App() {
           defense: careerPlayer.attributes.perimeterDefense,
           playmaking: careerPlayer.attributes.ballHandle,
           athleticism: Math.floor((careerPlayer.attributes.vertical + careerPlayer.attributes.strength) / 2),
+          rebounding: careerPlayer.attributes.rebounding,
           iq: Math.floor((careerPlayer.attributes.awareness + careerPlayer.attributes.passingAccuracy) / 2),
           consistency: careerPlayer.attributes.shootingConsistency
         },
@@ -1262,9 +1953,29 @@ export default function App() {
     );
   };
 
-  const handleShoot = () => {
+  const handleShoot = (fade: boolean = false) => {
     if (isShot || stamina < 15) return;
     
+    setIsFading(fade);
+    
+    if (is3PointContest) {
+      if (contestStatus !== 'playing') return;
+      
+      // Advance ball/rack
+      setContestBall(b => {
+        if (b === 4) {
+          if (contestRack === 4) {
+            // Last ball of last rack
+            setTimeout(() => setContestStatus('finished'), 2000);
+            return 4;
+          }
+          setContestRack(r => r + 1);
+          return 0;
+        }
+        return b + 1;
+      });
+    }
+
     const powerMult = isTakeoverActive ? 1.2 : 1;
     const rad = (angle * Math.PI) / 180;
     const p = (8 + (power * 8)) * powerMult; // Power scale
@@ -1283,15 +1994,32 @@ export default function App() {
     const vx = horizontalDir.x * horizontalP;
     const vz = horizontalDir.z * horizontalP;
     
-    setShotVelocity(new THREE.Vector3(vx, vy, vz));
+    // Adjust for fadeaway (backward momentum)
+    const finalVelocity = new THREE.Vector3(vx, vy, vz);
+    if (fade) {
+      const backwardDir = new THREE.Vector3(0, 0, 1).normalize(); // Away from hoop
+      finalVelocity.add(backwardDir.multiplyScalar(2));
+      finalVelocity.y += 1; // Higher arc for fadeaway
+      
+      // Shift player backward
+      setPlayerPos(prev => [prev[0], prev[1], prev[2] + 1.5]);
+      
+      // Fadeaways are harder
+      setShotMeterSensitivity(0.7);
+    } else {
+      setShotMeterSensitivity(1.0);
+    }
+    
+    setShotVelocity(finalVelocity);
     setIsShot(true);
     setIsGreen(power > 0.78 && power < 0.82);
     
     // Calculate coverage based on defender distance (simulated)
-    const coverage = Math.random() * 30; // 0-30% coverage
+    let coverage = Math.random() * 30; // 0-30% coverage
+    if (fade) coverage *= 0.5; // Fadeaway creates space
     setShotCoverage(coverage);
     
-    addLog(`${activePlayer.name} takes the shot! (${coverage < 10 ? 'Wide Open' : coverage < 20 ? 'Open' : 'Contested'})`);
+    addLog(`${activePlayer.name} takes the ${fade ? 'FADEAWAY' : 'shot'}! (${coverage < 10 ? 'Wide Open' : coverage < 20 ? 'Open' : 'Contested'})`);
     
     setStamina(prev => Math.max(0, prev - 15));
     setShotClock(24);
@@ -1299,9 +2027,24 @@ export default function App() {
 
   const handleReset = () => {
     setIsShot(false);
+    setIsFading(false);
+    setShotMeterSensitivity(1.0);
   };
 
   const handleScore = () => {
+    if (is3PointContest) {
+      const isMoneyBall = contestBall === 0; // The ball state was already incremented in handleShoot, so 0 means we just shot the 4th ball (index 4)
+      // Actually, let's check the previous state. 
+      // It's easier to just use a local variable or pass it.
+      // But since we are in a callback, let's just use the current state and assume it's correct.
+      // Wait, if I increment in handleShoot, then handleScore (which happens later) will see the NEW state.
+      // If contestBall is 0, it means we just finished a rack.
+      const points = (contestBall === 0) ? 2 : 1;
+      setContestScore(s => s + points);
+      addLog(`3PT Contest: ${points === 2 ? 'MONEY BALL! (+2)' : 'Score! (+1)'}`);
+      return;
+    }
+
     addLog(`${activePlayer.name} scores! (+2)`);
     setScore(s => {
       const newScore = s + 1;
@@ -1474,14 +2217,12 @@ export default function App() {
           >
             Roster
           </button>
-          {(user?.email === MY_EMAIL) && (
-            <button 
-              onClick={() => setView('myCareer')}
-              className={`hover:text-[#ce1141] transition-colors ${view === 'myCareer' || view === 'city' ? 'text-[#ce1141]' : ''}`}
-            >
-              MyCAREER
-            </button>
-          )}
+          <button 
+            onClick={() => setView('myCareer')}
+            className={`hover:text-[#ce1141] transition-colors ${view === 'myCareer' || view === 'city' ? 'text-[#ce1141]' : ''}`}
+          >
+            MyCAREER
+          </button>
           <button 
             onClick={() => setView('myTeam')}
             className={`hover:text-[#ce1141] transition-colors ${view === 'myTeam' ? 'text-[#ce1141]' : ''}`}
@@ -1595,17 +2336,15 @@ export default function App() {
                   bringing real NBA movements directly to your controller.
                 </p>
                 <div className="flex flex-col sm:flex-row gap-4 justify-center">
-                  {(user?.email === MY_EMAIL) && (
-                    <button 
-                      onClick={() => setView('myCareer')}
-                      className="group relative bg-white text-black px-10 py-4 font-black text-sm tracking-widest uppercase overflow-hidden"
-                    >
-                      <span className="relative z-10 flex items-center gap-2">
-                        Start Your Journey <Play size={16} fill="black" />
-                      </span>
-                      <div className="absolute inset-0 bg-[#ce1141] translate-y-full group-hover:translate-y-0 transition-transform duration-300" />
-                    </button>
-                  )}
+                  <button 
+                    onClick={() => setView('myCareer')}
+                    className="group relative bg-white text-black px-10 py-4 font-black text-sm tracking-widest uppercase overflow-hidden"
+                  >
+                    <span className="relative z-10 flex items-center gap-2">
+                      Start Your Journey <Play size={16} fill="black" />
+                    </span>
+                    <div className="absolute inset-0 bg-[#ce1141] translate-y-full group-hover:translate-y-0 transition-transform duration-300" />
+                  </button>
                   <button 
                     onClick={() => setView('roster')}
                     className="border border-white/20 hover:border-white px-10 py-4 font-black text-sm tracking-widest uppercase transition-colors"
@@ -1638,7 +2377,7 @@ export default function App() {
                     icon: <MapPin className="text-[#ce1141]" />,
                     img: "https://picsum.photos/seed/city/800/600"
                   }
-                ].filter(f => (f.title !== "MyCAREER" && f.title !== "The City") || user?.email === MY_EMAIL).map((feature, i) => (
+                ].map((feature, i) => (
                   <motion.div 
                     key={i}
                     initial={{ y: 30, opacity: 0 }}
@@ -1889,7 +2628,7 @@ export default function App() {
           </motion.main>
         ) : view === 'city' ? (
           <CityView onEnterGame={() => setView('game')} onBack={() => setView('myCareer')} />
-        ) : (view === 'myCareer' && user?.email === MY_EMAIL) ? (
+        ) : view === 'myCareer' ? (
           <motion.main
             key="myCareer"
             initial={{ opacity: 0 }}
@@ -2028,11 +2767,37 @@ export default function App() {
                       </div>
                     </div>
 
+                    <div className="mt-6 flex items-center justify-between border-t border-white/5 pt-6">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[#f58220] font-black italic text-xs">VC</span>
+                        <span className="text-xl font-black">{vc.toLocaleString()}</span>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-[8px] font-bold tracking-[0.2em] text-white/40 uppercase mb-1">3PT High Score</div>
+                        <div className="text-xl font-black italic text-[#ce1141]">{contestHighScore}</div>
+                      </div>
+                    </div>
+
                     <button 
                       onClick={() => setView('city')}
                       className="w-full mt-4 bg-[#ce1141] hover:bg-[#f0144c] py-4 flex items-center justify-center gap-3 text-sm font-black uppercase italic tracking-tighter transition-all shadow-[0_0_20px_rgba(206,17,65,0.2)]"
                     >
                       <MapPin size={18} /> Enter The City
+                    </button>
+
+                    <button 
+                      onClick={() => {
+                        setIs3PointContest(true);
+                        setContestStatus('idle');
+                        setContestScore(0);
+                        setContestTime(60);
+                        setContestRack(0);
+                        setContestBall(0);
+                        setView('game');
+                      }}
+                      className="w-full mt-4 bg-white/5 hover:bg-white/10 border border-white/10 py-4 flex items-center justify-center gap-3 text-sm font-black uppercase italic tracking-tighter transition-all"
+                    >
+                      <Target size={18} className="text-[#ce1141]" /> 3-Point Contest
                     </button>
 
                     <button 
@@ -2068,90 +2833,174 @@ export default function App() {
 
                 {/* Main Career Content */}
                 <div className="lg:col-span-8 space-y-8">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                      {/* Attributes Upgrade */}
-                      <div className="bg-[#111] p-8 border border-white/5">
-                        <h3 className="text-sm font-black italic uppercase tracking-widest mb-8 flex justify-between items-center">
-                          Attributes
-                          <span className="text-[10px] text-white/40">Potential: 99 OVR</span>
-                        </h3>
-                        <div className="space-y-6">
-                          {Object.entries(careerPlayer.attributes).map(([key, value]) => (
-                            <div key={key} className="space-y-2">
-                              <div className="flex justify-between items-center">
-                                <span className="text-[10px] font-bold tracking-widest uppercase text-white/60">{key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase())}</span>
-                                <div className="flex items-center gap-4">
-                                  <span className="text-sm font-black italic">{value}</span>
-                                  <button 
-                                    onClick={() => {
-                                      if (vc >= 500 && value < 99) {
-                                        if (user?.email !== MY_EMAIL) setVc(v => v - 500);
-                                        setCareerPlayer(prev => prev ? ({
-                                          ...prev,
-                                          attributes: { ...prev.attributes, [key]: value + 1 },
-                                          rating: Math.min(99, prev.rating + 0.2)
-                                        }) : null);
-                                      }
-                                    }}
-                                    disabled={(vc < 500 && user?.email !== MY_EMAIL) || value >= 99}
-                                    className="bg-[#ce1141] hover:bg-[#f0144c] disabled:bg-white/5 disabled:text-white/10 px-3 py-1 text-[10px] font-black uppercase transition-all"
-                                  >
-                                    +
-                                  </button>
+                  <div className="flex gap-4 mb-2">
+                    {['attributes', 'progression', 'inventory'].map(tab => (
+                      <button
+                        key={tab}
+                        onClick={() => setCareerTab(tab as any)}
+                        className={`px-6 py-3 text-[10px] font-black uppercase tracking-widest transition-all border-b-2 ${careerTab === tab ? 'border-[#ce1141] text-white bg-[#ce1141]/10' : 'border-transparent text-white/40 hover:text-white/60'}`}
+                      >
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
+
+                  <AnimatePresence mode="wait">
+                    {careerTab === 'attributes' ? (
+                      <motion.div 
+                        key="attributes"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        className="grid grid-cols-1 md:grid-cols-2 gap-8"
+                      >
+                        {/* Attributes Upgrade */}
+                        <div className="bg-[#111] p-8 border border-white/5">
+                          <h3 className="text-sm font-black italic uppercase tracking-widest mb-8 flex justify-between items-center">
+                            Attributes
+                            <span className="text-[10px] text-white/40">Potential: 99 OVR</span>
+                          </h3>
+                          <div className="space-y-6">
+                            {Object.entries(careerPlayer.attributes).map(([key, value]) => (
+                              <div key={key} className="space-y-2">
+                                <div className="flex justify-between items-center">
+                                  <span className="text-[10px] font-bold tracking-widest uppercase text-white/60">{key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase())}</span>
+                                  <div className="flex items-center gap-4">
+                                    <span className="text-sm font-black italic">{value}</span>
+                                    <button 
+                                      onClick={() => {
+                                        if (vc >= 500 && value < 99) {
+                                          setVc(prev => prev - 500);
+                                          setCareerPlayer(prev => prev ? ({
+                                            ...prev,
+                                            attributes: { ...prev.attributes, [key]: value + 1 },
+                                            rating: Math.min(99, prev.rating + 0.2)
+                                          }) : null);
+                                        }
+                                      }}
+                                      disabled={(vc < 500 && user?.email !== MY_EMAIL) || value >= 99}
+                                      className="bg-[#ce1141] hover:bg-[#f0144c] disabled:bg-white/5 disabled:text-white/10 px-3 py-1 text-[10px] font-black uppercase transition-all"
+                                    >
+                                      +
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="h-1 bg-white/5 rounded-full overflow-hidden relative">
+                                  <div className="h-full bg-[#ce1141]" style={{ width: `${value}%` }} />
+                                  <div className="absolute top-0 bottom-0 w-0.5 bg-white/20" style={{ left: '99%' }} />
                                 </div>
                               </div>
-                              <div className="h-1 bg-white/5 rounded-full overflow-hidden relative">
-                                <div className="h-full bg-[#ce1141]" style={{ width: `${value}%` }} />
-                                {/* Potential Cap Marker */}
-                                <div className="absolute top-0 bottom-0 w-0.5 bg-white/20" style={{ left: '99%' }} />
-                              </div>
-                            </div>
-                          ))}
+                            ))}
+                          </div>
                         </div>
-                      </div>
 
-                    {/* Career Actions & Social */}
-                    <div className="space-y-8">
-                      <div className="bg-[#ce1141] p-8 cursor-pointer hover:bg-[#f0144c] transition-all group"
-                        onClick={() => setView('game')}
+                        {/* Career Actions & Social */}
+                        <div className="space-y-8">
+                          <div className="bg-[#ce1141] p-8 cursor-pointer hover:bg-[#f0144c] transition-all group"
+                            onClick={() => setView('game')}
+                          >
+                            <h3 className="text-2xl font-black italic uppercase tracking-tighter mb-2">Play Next Game</h3>
+                            <p className="text-white/80 text-xs mb-6">Earn VC and XP by performing on the court.</p>
+                            <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
+                              Enter Arena <ChevronRight size={14} className="group-hover:translate-x-1 transition-transform" />
+                            </div>
+                          </div>
+
+                          {/* Social Feed */}
+                          <div className="bg-[#111] p-6 border border-white/5">
+                            <h3 className="text-[10px] font-black italic uppercase tracking-widest mb-4 text-[#ce1141]">Social Feed</h3>
+                            <div className="space-y-4">
+                              {careerPlayer.socialFeed.map((post, i) => (
+                                <div key={i} className="border-b border-white/5 pb-3 last:border-0">
+                                  <div className="flex justify-between items-center mb-1">
+                                    <span className="text-[10px] font-bold text-white/60">{post.user}</span>
+                                    <span className="text-[8px] text-white/30">{post.time}</span>
+                                  </div>
+                                  <p className="text-[11px] text-white/80 leading-relaxed">{post.message}</p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Endorsements */}
+                          <div className="bg-[#111] p-6 border border-white/5">
+                            <h3 className="text-[10px] font-black italic uppercase tracking-widest mb-4 text-[#ce1141]">Endorsements</h3>
+                            <div className="grid grid-cols-2 gap-4">
+                              {careerPlayer.endorsements.map((end, i) => (
+                                <div key={i} className={`p-4 border ${end.status === 'Active' ? 'border-[#ce1141] bg-[#ce1141]/5' : 'border-white/5 opacity-40'} text-center`}>
+                                  <div className="text-xs font-black uppercase mb-1">{end.brand}</div>
+                                  <div className="text-[8px] font-bold uppercase tracking-widest">{end.status}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </motion.div>
+                    ) : careerTab === 'progression' ? (
+                      <motion.div 
+                        key="progression"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        className="bg-[#111] p-8 border border-white/5"
                       >
-                        <h3 className="text-2xl font-black italic uppercase tracking-tighter mb-2">Play Next Game</h3>
-                        <p className="text-white/80 text-xs mb-6">Earn VC and XP by performing on the court.</p>
-                        <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
-                          Enter Arena <ChevronRight size={14} className="group-hover:translate-x-1 transition-transform" />
-                        </div>
-                      </div>
-
-                      {/* Social Feed */}
-                      <div className="bg-[#111] p-6 border border-white/5">
-                        <h3 className="text-[10px] font-black italic uppercase tracking-widest mb-4 text-[#ce1141]">Social Feed</h3>
+                        <h3 className="text-sm font-black italic uppercase tracking-widest mb-8">Season Progression</h3>
                         <div className="space-y-4">
-                          {careerPlayer.socialFeed.map((post, i) => (
-                            <div key={i} className="border-b border-white/5 pb-3 last:border-0">
-                              <div className="flex justify-between items-center mb-1">
-                                <span className="text-[10px] font-bold text-white/60">{post.user}</span>
-                                <span className="text-[8px] text-white/30">{post.time}</span>
+                          {PROGRESSION_REWARDS.map((reward, i) => {
+                            const isUnlocked = careerPlayer.level >= reward.level;
+                            return (
+                              <div key={i} className={`flex items-center gap-6 p-6 border ${isUnlocked ? 'border-[#ce1141] bg-[#ce1141]/5' : 'border-white/5 opacity-40'}`}>
+                                <div className="w-12 h-12 flex items-center justify-center bg-black border border-white/10 text-[#ce1141] font-black italic text-xl">
+                                  {reward.level}
+                                </div>
+                                <div className="flex-grow">
+                                  <div className="text-[10px] font-bold text-white/40 uppercase tracking-widest mb-1">{reward.type}</div>
+                                  <div className="text-lg font-black italic uppercase tracking-tight">{reward.name}</div>
+                                  <div className="text-xs text-white/60">{reward.description}</div>
+                                </div>
+                                {isUnlocked ? (
+                                  <div className="text-[#ce1141]"><Star size={20} fill="#ce1141" /></div>
+                                ) : (
+                                  <div className="text-white/20"><Shield size={20} /></div>
+                                )}
                               </div>
-                              <p className="text-[11px] text-white/80 leading-relaxed">{post.message}</p>
+                            );
+                          })}
+                        </div>
+                      </motion.div>
+                    ) : (
+                      <motion.div 
+                        key="inventory"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        className="bg-[#111] p-8 border border-white/5"
+                      >
+                        <h3 className="text-sm font-black italic uppercase tracking-widest mb-8">Inventory & Animations</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                          {careerPlayer.inventory.map((item, i) => (
+                            <div key={i} className={`p-6 border ${item.equipped ? 'border-[#ce1141] bg-[#ce1141]/5' : 'border-white/5'} flex justify-between items-center`}>
+                              <div>
+                                <div className="text-[10px] font-bold text-white/40 uppercase tracking-widest mb-1">{item.type}</div>
+                                <div className="text-lg font-black italic uppercase tracking-tight">{item.name}</div>
+                              </div>
+                              <button
+                                onClick={() => toggleInventoryItem(item.id)}
+                                className={`px-4 py-2 text-[10px] font-black uppercase tracking-widest transition-all ${item.equipped ? 'bg-[#ce1141] text-white' : 'border border-white/20 text-white/60 hover:border-white/60'}`}
+                              >
+                                {item.equipped ? 'Equipped' : 'Equip'}
+                              </button>
                             </div>
                           ))}
-                        </div>
-                      </div>
-
-                      {/* Endorsements */}
-                      <div className="bg-[#111] p-6 border border-white/5">
-                        <h3 className="text-[10px] font-black italic uppercase tracking-widest mb-4 text-[#ce1141]">Endorsements</h3>
-                        <div className="grid grid-cols-2 gap-4">
-                          {careerPlayer.endorsements.map((end, i) => (
-                            <div key={i} className={`p-4 border ${end.status === 'Active' ? 'border-[#ce1141] bg-[#ce1141]/5' : 'border-white/5 opacity-40'} text-center`}>
-                              <div className="text-xs font-black uppercase mb-1">{end.brand}</div>
-                              <div className="text-[8px] font-bold uppercase tracking-widest">{end.status}</div>
+                          {careerPlayer.inventory.length === 0 && (
+                            <div className="col-span-2 py-12 text-center text-white/20 font-bold uppercase tracking-widest">
+                              No items in inventory. Level up to unlock rewards!
                             </div>
-                          ))}
+                          )}
                         </div>
-                      </div>
-                    </div>
-                  </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
 
                   {/* The City Hub */}
                   <div className="bg-[#111] p-8 border border-white/5">
@@ -2239,11 +3088,88 @@ export default function App() {
           >
             {/* Exit Button */}
             <button 
-              onClick={() => setView('landing')}
+              onClick={() => {
+                if (is3PointContest) {
+                  setIs3PointContest(false);
+                  setView('myCareer');
+                } else {
+                  setView('landing');
+                }
+              }}
               className="absolute top-8 left-8 bg-black/60 backdrop-blur-md border border-white/10 px-6 py-3 text-[10px] font-black uppercase tracking-widest hover:bg-white hover:text-black transition-all z-50"
             >
-              Exit Game
+              {is3PointContest ? 'Quit Contest' : 'Exit Game'}
             </button>
+
+            {is3PointContest && (
+              <div className="absolute top-24 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-4">
+                <div className="flex gap-8 bg-black/60 backdrop-blur-xl p-6 border border-white/10 rounded-2xl shadow-2xl">
+                  <div className="text-center">
+                    <div className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-1">Time</div>
+                    <div className={`text-4xl font-black italic ${contestTime < 10 ? 'text-[#ce1141] animate-pulse' : 'text-white'}`}>
+                      {contestTime}s
+                    </div>
+                  </div>
+                  <div className="w-px h-12 bg-white/10" />
+                  <div className="text-center">
+                    <div className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-1">Score</div>
+                    <div className="text-4xl font-black italic text-[#ce1141]">{contestScore}</div>
+                  </div>
+                  <div className="w-px h-12 bg-white/10" />
+                  <div className="text-center">
+                    <div className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-1">Rack</div>
+                    <div className="text-4xl font-black italic text-white">{contestRack + 1}/5</div>
+                  </div>
+                </div>
+
+                {contestStatus === 'idle' && (
+                  <motion.button
+                    initial={{ scale: 0.8, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    className="bg-[#ce1141] hover:bg-[#f0144c] px-12 py-4 rounded-sm text-xl font-black italic uppercase tracking-tighter transition-all shadow-[0_0_30px_rgba(206,17,65,0.4)]"
+                    onClick={() => setContestStatus('playing')}
+                  >
+                    Start Contest
+                  </motion.button>
+                )}
+
+                {contestStatus === 'finished' && (
+                  <motion.div
+                    initial={{ y: 20, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    className="bg-black/80 backdrop-blur-xl p-8 border border-[#ce1141] rounded-2xl flex flex-col items-center gap-6"
+                  >
+                    <h2 className="text-4xl font-black italic uppercase tracking-tighter">Contest Finished</h2>
+                    <div className="text-6xl font-black italic text-[#ce1141]">{contestScore} PTS</div>
+                    <button 
+                      onClick={() => {
+                        setIs3PointContest(false);
+                        setView('myCareer');
+                      }}
+                      className="bg-white text-black px-8 py-3 text-sm font-black uppercase tracking-widest hover:bg-gray-200 transition-all"
+                    >
+                      Back to MyCAREER
+                    </button>
+                  </motion.div>
+                )}
+              </div>
+            )}
+
+            {/* Rebound Message */}
+            <AnimatePresence>
+              {reboundMessage && (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.5, y: -50 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 1.5, y: -100 }}
+                  className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-[60] pointer-events-none"
+                >
+                  <div className="text-6xl font-black italic text-[#ce1141] uppercase tracking-tighter drop-shadow-[0_0_20px_rgba(206,17,65,0.5)]">
+                    {reboundMessage}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* HUD */}
             <BroadcastScoreboard 
@@ -2263,16 +3189,25 @@ export default function App() {
             <AnimatePresence>
               {isDribbling && (
                 <motion.div
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="fixed bottom-1/4 left-1/2 -translate-x-1/2 z-50 pointer-events-none"
+                  initial={{ opacity: 0, y: 20, scale: 0.8 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -20, scale: 1.2 }}
+                  className="fixed bottom-1/4 left-1/2 -translate-x-1/2 z-50 pointer-events-none flex flex-col items-center"
                 >
                   <div className="bg-[#ce1141] px-6 py-2 rounded-sm skew-x-[-12deg] shadow-[0_0_30px_rgba(206,17,65,0.5)]">
                     <span className="text-xl font-black italic uppercase tracking-tighter text-white">
                       {dribbleType}
                     </span>
                   </div>
+                  {dribbleCombo > 1 && (
+                    <motion.div 
+                      initial={{ scale: 0 }}
+                      animate={{ scale: 1 }}
+                      className="bg-yellow-500 text-black px-3 py-1 text-[10px] font-black uppercase tracking-widest mt-2 rounded-sm skew-x-[-12deg]"
+                    >
+                      Combo x{dribbleCombo}
+                    </motion.div>
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>
@@ -2311,39 +3246,107 @@ export default function App() {
                   </div>
                 </div>
 
-                <button 
-                  onClick={movePlayer}
-                  className="w-24 h-24 rounded-full bg-black/60 backdrop-blur-md border-4 border-white/20 flex flex-col items-center justify-center group active:scale-95 transition-all shadow-2xl"
-                >
-                  <MapPin className="text-white group-hover:text-[#ce1141] mb-1" size={24} />
-                  <span className="text-[10px] font-black uppercase tracking-widest">Move</span>
-                </button>
+                <div className="flex flex-col gap-4 items-center">
+                  <div className="md:hidden">
+                    <Joystick onMove={setJoystickDir} />
+                  </div>
+                  <div className="hidden md:flex flex-col items-center gap-2 bg-black/40 backdrop-blur-md p-4 rounded-2xl border border-white/10">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-white/40 mb-2">Keyboard Controls</div>
+                    <div className="flex gap-2">
+                      <div className="w-8 h-8 rounded bg-white/10 flex items-center justify-center text-xs font-bold border border-white/20">W</div>
+                    </div>
+                    <div className="flex gap-2">
+                      <div className="w-8 h-8 rounded bg-white/10 flex items-center justify-center text-xs font-bold border border-white/20">A</div>
+                      <div className="w-8 h-8 rounded bg-white/10 flex items-center justify-center text-xs font-bold border border-white/20">S</div>
+                      <div className="w-8 h-8 rounded bg-white/10 flex items-center justify-center text-xs font-bold border border-white/20">D</div>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               {/* Right Side: Dribble & Shoot */}
               <div className="flex flex-col gap-6 items-end pointer-events-auto">
-                <div className="flex gap-3">
-                  <button 
-                    onClick={() => {
-                      const moves = ['Crossover', 'Between the Legs', 'Behind the Back', 'Step Back'];
-                      const randomMove = moves[Math.floor(Math.random() * moves.length)];
-                      performDribble(randomMove);
-                    }}
-                    className="w-20 h-20 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[10px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                {dribbleCombo > 0 && (
+                  <motion.div 
+                    initial={{ opacity: 0, x: 20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="bg-black/60 backdrop-blur-md border border-yellow-500/30 p-3 rounded-xl flex flex-col items-end gap-1"
                   >
-                    Dribble
+                    <div className="text-[8px] font-black text-yellow-500 uppercase tracking-widest">Dribble Combo</div>
+                    <div className="flex gap-1">
+                      {[1, 2, 3, 4, 5].map(i => (
+                        <div 
+                          key={i} 
+                          className={`w-4 h-1 rounded-full transition-all ${i <= dribbleCombo ? 'bg-yellow-500' : 'bg-white/10'}`} 
+                        />
+                      ))}
+                    </div>
+                  </motion.div>
+                )}
+                <div className="flex flex-col gap-2 items-end">
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => performDribble('Crossover')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      Cross
+                    </button>
+                    <button 
+                      onClick={() => performDribble('Between the Legs')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      BTL
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => performDribble('Behind the Back')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      BTB
+                    </button>
+                    <button 
+                      onClick={() => performDribble('Spin')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      Spin
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => performDribble('Step Back')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      Step
+                    </button>
+                    <button 
+                      onPointerDown={() => { if(!isShot) { setIsChargingFade(true); setPower(0); } }}
+                      onPointerUp={() => { if(isChargingFade) { setIsChargingFade(false); handleShoot(true); } }}
+                      onPointerLeave={() => { if(isChargingFade) { setIsChargingFade(false); handleShoot(true); } }}
+                      className={`w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 ${isChargingFade ? 'border-[#ce1141] shadow-[0_0_20px_rgba(206,17,65,0.5)]' : 'border-white/10'} flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]`}
+                    >
+                      Fade
+                    </button>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button 
+                    onClick={handleJump}
+                    className={`w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 ${isReboundable ? 'border-[#ce1141] animate-pulse' : 'border-white/10'} flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]`}
+                  >
+                    Rebound
+                  </button>
+                  <button 
+                    onPointerDown={() => { if(!isShot) { setIsCharging(true); setPower(0); } }}
+                    onPointerUp={() => { if(isCharging) { setIsCharging(false); handleShoot(); } }}
+                    onPointerLeave={() => { if(isCharging) { setIsCharging(false); handleShoot(); } }}
+                    className={`w-36 h-36 rounded-full flex items-center justify-center font-black text-2xl italic uppercase tracking-tighter transition-all shadow-[0_0_50px_rgba(206,17,65,0.3)] ${
+                      isShot ? 'bg-white/10 text-white/20 cursor-not-allowed' : 'bg-[#ce1141] text-white active:scale-90 hover:shadow-[0_0_60px_rgba(206,17,65,0.6)]'
+                    }`}
+                  >
+                    {isShot ? '...' : 'Shoot'}
                   </button>
                 </div>
-                <button 
-                  onPointerDown={() => { if(!isShot) { setIsCharging(true); setPower(0); } }}
-                  onPointerUp={() => { if(isCharging) { setIsCharging(false); handleShoot(); } }}
-                  onPointerLeave={() => { if(isCharging) { setIsCharging(false); handleShoot(); } }}
-                  className={`w-36 h-36 rounded-full flex items-center justify-center font-black text-2xl italic uppercase tracking-tighter transition-all shadow-[0_0_50px_rgba(206,17,65,0.3)] ${
-                    isShot ? 'bg-white/10 text-white/20 cursor-not-allowed' : 'bg-[#ce1141] text-white active:scale-90 hover:shadow-[0_0_60px_rgba(206,17,65,0.6)]'
-                  }`}
-                >
-                  {isShot ? '...' : 'Shoot'}
-                </button>
               </div>
             </div>
 
@@ -2382,13 +3385,39 @@ export default function App() {
                   <Stadium />
                   <Court />
                   <Hoop />
-                  <Defender position={[0, 0, -2]} />
-                  <PlayerModel player={activePlayer} position={playerPos} />
+                  {is3PointContest && CONTEST_POSITIONS.map((pos, i) => (
+                    <BallRack 
+                      key={i} 
+                      position={[pos[0] * 1.1, 0, pos[2] * 1.1]} 
+                      active={contestRack === i} 
+                    />
+                  ))}
+                  {!is3PointContest && (
+                    <Defender 
+                      initialPosition={[0, 0, -2]} 
+                      playerPos={playerPos} 
+                      isDribbling={isDribbling} 
+                      dribbleCombo={dribbleCombo} 
+                      isBroken={isDefenderBroken}
+                      isReboundable={isReboundable}
+                      ballPos={ballPos}
+                      isJumping={isDefenderJumping}
+                    />
+                  )}
+                  <PlayerModel 
+                    player={activePlayer} 
+                    position={playerPos} 
+                    isFading={isFading} 
+                    dribbleAnimation={dribbleAnimation}
+                    isJumping={isJumping}
+                  />
                   <PlayerIndicator 
                     position={playerPos} 
                     stamina={stamina} 
                     takeoverMeter={takeoverMeter} 
                     isTakeoverActive={isTakeoverActive} 
+                    isFading={isFading}
+                    isDribbling={isDribbling}
                   />
                   <Basketball 
                     isShot={isShot} 
@@ -2397,6 +3426,9 @@ export default function App() {
                     onScore={handleScore} 
                     isGreen={isGreen}
                     initialPos={[playerPos[0], playerPos[1] + 1.2, playerPos[2] - 0.5]}
+                    isDribbling={isDribbling}
+                    dribbleType={dribbleType}
+                    onBallUpdate={handleBallUpdate}
                   />
                   
                   {/* Visual Feedback */}
