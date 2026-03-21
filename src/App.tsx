@@ -22,7 +22,7 @@ const DRAG = 0.15;
 const RESTITUTION = 0.75;
 const FRICTION = 0.8;
 const SPIN_BOUNCE_FACTOR = 0.15;
-const BALL_RADIUS = 0.24;
+const BALL_RADIUS = 0.12;
 const RIM_RADIUS = 0.23;
 const RIM_THICKNESS = 0.02;
 const HOOP_POS = new THREE.Vector3(0, 3.05, -4.6);
@@ -197,28 +197,30 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
     if (pos.current.y < BALL_RADIUS) {
       pos.current.y = BALL_RADIUS;
       
-      // Bounce with energy loss
-      vel.current.y *= -RESTITUTION;
-      
-      // Spin-to-Linear velocity transfer (Friction)
-      const frictionCoefficient = 0.35;
-      const surfaceVel = new THREE.Vector3(
-        vel.current.x + angVel.current.z * BALL_RADIUS,
-        0,
-        vel.current.z - angVel.current.x * BALL_RADIUS
-      );
-      
-      vel.current.x -= surfaceVel.x * frictionCoefficient;
-      vel.current.z -= surfaceVel.z * frictionCoefficient;
-      
-      // Linear-to-Spin velocity transfer
-      angVel.current.x += surfaceVel.z * frictionCoefficient * 2;
-      angVel.current.z -= surfaceVel.x * frictionCoefficient * 2;
+      // Normal impulse
+      const v_normal = vel.current.y;
+      if (v_normal < 0) {
+        vel.current.y *= -RESTITUTION;
+        
+        // Friction and Spin Transfer
+        const friction = 0.4;
+        const v_contact_x = vel.current.x + angVel.current.z * BALL_RADIUS;
+        const v_contact_z = vel.current.z - angVel.current.x * BALL_RADIUS;
+        
+        const impulse_x = -v_contact_x * friction;
+        const impulse_z = -v_contact_z * friction;
+        
+        vel.current.x += impulse_x;
+        vel.current.z += impulse_z;
+        
+        angVel.current.x -= impulse_z / (0.66 * BALL_RADIUS);
+        angVel.current.z += impulse_x / (0.66 * BALL_RADIUS);
+      }
       
       // Damping
       vel.current.x *= FRICTION;
       vel.current.z *= FRICTION;
-      angVel.current.multiplyScalar(0.85);
+      angVel.current.multiplyScalar(0.95);
     }
 
     // 7. Collision with Backboard
@@ -231,47 +233,84 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
       
       if (Math.abs(pos.current.z - BACKBOARD_POS.z) < BALL_RADIUS + 0.05) {
         // Reflect Z
-        vel.current.z *= -RESTITUTION;
-        pos.current.z = BACKBOARD_POS.z + BALL_RADIUS + 0.06;
-        
-        // Spin influence on backboard (kick)
-        vel.current.x += angVel.current.y * 0.1;
-        vel.current.y += angVel.current.x * 0.1;
-        
-        // Add some random rattle
-        angVel.current.add(new THREE.Vector3((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10));
+        const v_normal = vel.current.z;
+        if (v_normal < 0) {
+          vel.current.z *= -0.6; // Stiffer than ground
+          pos.current.z = BACKBOARD_POS.z + BALL_RADIUS + 0.01;
+          
+          // Spin influence
+          const friction = 0.3;
+          const v_contact_x = vel.current.x + angVel.current.y * BALL_RADIUS;
+          const v_contact_y = vel.current.y - angVel.current.x * BALL_RADIUS;
+          
+          const impulse_x = -v_contact_x * friction;
+          const impulse_y = -v_contact_y * friction;
+          
+          vel.current.x += impulse_x;
+          vel.current.y += impulse_y;
+          
+          angVel.current.x -= impulse_y / (0.66 * BALL_RADIUS);
+          angVel.current.y += impulse_x / (0.66 * BALL_RADIUS);
+          
+          // Rattle
+          angVel.current.add(new THREE.Vector3((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5));
+        }
       }
     }
 
-    // 8. Collision with Rim (Improved)
-    const distToHoopCenter = new THREE.Vector2(pos.current.x - HOOP_POS.x, pos.current.z - HOOP_POS.z).length();
-    const heightDiff = Math.abs(pos.current.y - HOOP_POS.y);
+    // 8. Collision with Rim (Accurate Torus Collision)
+    const relPos = pos.current.clone().sub(HOOP_POS);
+    const distToCenterAxis = new THREE.Vector2(relPos.x, relPos.z).length();
+    
+    // Find nearest point on the rim's center circle
+    const nearestPointOnCircle = new THREE.Vector3(
+      relPos.x / distToCenterAxis * RIM_RADIUS,
+      0,
+      relPos.z / distToCenterAxis * RIM_RADIUS
+    );
+    
+    const distToRim = relPos.distanceTo(nearestPointOnCircle);
+    const collisionThreshold = BALL_RADIUS + RIM_THICKNESS;
 
-    if (heightDiff < BALL_RADIUS && Math.abs(distToHoopCenter - RIM_RADIUS) < BALL_RADIUS) {
-      const normal = pos.current.clone().sub(HOOP_POS).normalize();
-      
-      // Reflect with spin influence
+    if (distToRim < collisionThreshold) {
+      const normal = relPos.clone().sub(nearestPointOnCircle).normalize();
       const dot = vel.current.dot(normal);
-      vel.current.sub(normal.clone().multiplyScalar(2 * dot));
-      vel.current.multiplyScalar(RESTITUTION);
       
-      // Rim "grab" based on spin
-      const rimFriction = 0.2;
-      vel.current.x += angVel.current.z * rimFriction;
-      vel.current.z -= angVel.current.x * rimFriction;
-      
-      // Jitter for rim springiness
-      vel.current.add(new THREE.Vector3((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 0.5));
-      
-      pos.current.add(normal.multiplyScalar(0.05));
-      angVel.current.multiplyScalar(0.6);
+      if (dot < 0) {
+        // Reflect
+        vel.current.sub(normal.clone().multiplyScalar(2 * dot));
+        vel.current.multiplyScalar(0.5); // Rim absorbs energy
+        
+        // Spin transfer on rim
+        const friction = 0.5;
+        const v_tangent = vel.current.clone().sub(normal.clone().multiplyScalar(vel.current.dot(normal)));
+        const spin_vel = new THREE.Vector3().crossVectors(angVel.current, normal.clone().multiplyScalar(-BALL_RADIUS));
+        const v_contact = v_tangent.clone().add(spin_vel);
+        
+        const impulse = v_contact.clone().multiplyScalar(-friction);
+        vel.current.add(impulse);
+        
+        // Update angular velocity: dw = r x impulse / I
+        const r = normal.clone().multiplyScalar(-BALL_RADIUS);
+        const dw = new THREE.Vector3().crossVectors(r, impulse).divideScalar(0.66 * BALL_RADIUS * BALL_RADIUS);
+        angVel.current.add(dw);
+        
+        // Jitter for springiness
+        vel.current.add(new THREE.Vector3((Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.8));
+        
+        // Push out of collision
+        pos.current.add(normal.multiplyScalar(collisionThreshold - distToRim + 0.01));
+      }
     }
 
     // 8. Scoring logic
     const distToHoop = pos.current.distanceTo(HOOP_POS);
-    if (!scored && vel.current.y < 0 && distToHoop < 0.4 && pos.current.y > HOOP_POS.y) {
+    if (!scored && vel.current.y < 0 && distToHoop < 0.25 && pos.current.y > HOOP_POS.y) {
       setScored(true);
       onScore();
+      if (distToHoop < 0.1) {
+        console.log('SWISH!');
+      }
     }
 
     // 9. Reset if too far or too low
@@ -1796,6 +1835,21 @@ export default function App() {
 
   // Persist to Firestore/Local
   useEffect(() => {
+    if (careerPlayer && !careerPlayer.badges.some(b => b.name === 'Defensive Stopper')) {
+      setCareerPlayer(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          badges: [
+            ...prev.badges,
+            { name: "Defensive Stopper", level: "Bronze", description: "Boosts perimeter defense when closing out.", category: "Defense" }
+          ]
+        };
+      });
+    }
+  }, [careerPlayer]);
+
+  useEffect(() => {
     if (careerPlayer) {
       localStorage.setItem('myCareerPlayer', JSON.stringify(careerPlayer));
       if (user) {
@@ -2672,7 +2726,10 @@ export default function App() {
                         awareness: 65,
                         shootingConsistency: 75
                       },
-                      badges: [{ name: "Limitless Range", level: "Bronze", description: "Increases the range from which a player can effectively shoot.", category: "Shooting" }],
+                      badges: [
+                        { name: "Limitless Range", level: "Bronze", description: "Increases the range from which a player can effectively shoot.", category: "Shooting" },
+                        { name: "Defensive Stopper", level: "Bronze", description: "Boosts perimeter defense when closing out.", category: "Defense" }
+                      ],
                       level: 1,
                       xp: 0,
                       season: 1,
@@ -2721,7 +2778,10 @@ export default function App() {
                         awareness: 60,
                         shootingConsistency: 60
                       },
-                      badges: [{ name: "Posterizer", level: "Bronze", description: "Increases the chances of throwing down a dunk on a defender.", category: "Finishing" }],
+                      badges: [
+                        { name: "Posterizer", level: "Bronze", description: "Increases the chances of throwing down a dunk on a defender.", category: "Finishing" },
+                        { name: "Defensive Stopper", level: "Bronze", description: "Boosts perimeter defense when closing out.", category: "Defense" }
+                      ],
                       level: 1,
                       xp: 0,
                       season: 1,
