@@ -18,7 +18,11 @@ import { PROGRESSION_REWARDS } from './data/progression';
 // --- 3D Game Constants ---
 const GRAVITY = -9.81;
 const INITIAL_BALL_POS: [number, number, number] = [0, 1.2, 5];
-const DRAG = 0.15;
+const DRAG_COEFFICIENT = 0.47; // Sphere drag coefficient
+const AIR_DENSITY = 1.225; // kg/m^3
+const BALL_AREA = Math.PI * Math.pow(0.12, 2);
+const SPIN_DECAY = 0.98; // Continuous spin decay in air
+const MAGNUS_COEFFICIENT = 0.12; // Refined Magnus effect strength
 const RESTITUTION = 0.75;
 const FRICTION = 0.8;
 const SPIN_BOUNCE_FACTOR = 0.15;
@@ -38,6 +42,36 @@ const CONTEST_POSITIONS: [number, number, number][] = [
 ];
 
 // --- 3D Components ---
+
+type Difficulty = 'Easy' | 'Pro' | 'All-Star' | 'Hall of Fame';
+
+function ScreenShake({ isShaking }: { isShaking: boolean }) {
+  const { camera } = useThree();
+  const originalPos = useRef(new THREE.Vector3());
+  const shakeIntensity = 0.15;
+
+  useEffect(() => {
+    if (isShaking) {
+      originalPos.current.copy(camera.position);
+    }
+  }, [isShaking, camera]);
+
+  useFrame((state) => {
+    if (isShaking) {
+      const shake = new THREE.Vector3(
+        (Math.random() - 0.5) * shakeIntensity,
+        (Math.random() - 0.5) * shakeIntensity,
+        (Math.random() - 0.5) * shakeIntensity
+      );
+      camera.position.add(shake);
+    } else if (originalPos.current.length() > 0) {
+      // Smoothly return to original position
+      camera.position.lerp(originalPos.current, 0.1);
+    }
+  });
+
+  return null;
+}
 
 function ShotMeter({ power, isShot, isGreen, coverage }: { power: number, isShot: boolean, isGreen: boolean, coverage: number }) {
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -107,6 +141,7 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
   const angVel = useRef(new THREE.Vector3(0, 0, 0));
   const [scored, setScored] = useState(false);
   const [hasHitRim, setHasHitRim] = useState(false);
+  const [hasHitBackboard, setHasHitBackboard] = useState(false);
 
   useEffect(() => {
     if (isShot) {
@@ -115,11 +150,13 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
       angVel.current.set(-15, (Math.random() - 0.5) * 5, (Math.random() - 0.5) * 2);
       setScored(false);
       setHasHitRim(false);
+      setHasHitBackboard(false);
     } else if (!isDribbling) {
       pos.current.set(...initialPos);
       vel.current.set(0, 0, 0);
       angVel.current.set(0, 0, 0);
       setHasHitRim(false);
+      setHasHitBackboard(false);
     }
   }, [isShot, velocity, initialPos, isDribbling]);
 
@@ -127,9 +164,10 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
     if (!meshRef.current) return;
 
     if (onBallUpdate) {
-      // Ball is reboundable if it's in the air after a shot and hasn't scored
-      // Or if it hit the rim/backboard
-      const isReboundable = isShot && !scored && pos.current.y > 1.0 && pos.current.y < 4.5;
+      // Ball is reboundable if it's missed and hit rim/backboard or is falling
+      // We check if it hit something or if it's past the hoop and hasn't scored
+      const isMissed = isShot && !scored && (hasHitRim || hasHitBackboard || (pos.current.z < -4.6 && vel.current.y < 0));
+      const isReboundable = isMissed && pos.current.y > 0.5 && pos.current.y < 4.5;
       onBallUpdate(pos.current, isReboundable);
     }
 
@@ -152,6 +190,14 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
       } else if (dribbleType === 'Between the Legs') {
         targetX = playerX + Math.sin(time) * 0.4;
         targetZ = playerZ + Math.cos(time) * 0.6;
+      } else if (dribbleType === 'In-and-Out') {
+        targetX = playerX + Math.sin(time * 2) * 0.5;
+        targetY = playerY + Math.abs(Math.cos(time)) * 0.4;
+      } else if (dribbleType === 'Shammgod') {
+        targetX = playerX + Math.sin(time * 1.5) * 1.2;
+        targetZ = playerZ - 0.2;
+      } else if (dribbleType === 'Hesi') {
+        targetY = playerY + 0.5 + Math.sin(time * 0.5) * 0.2;
       }
 
       pos.current.lerp(new THREE.Vector3(targetX, targetY, targetZ), 0.2);
@@ -173,21 +219,30 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
     vel.current.y += GRAVITY * delta;
 
     // 2. Magnus Effect (Spin Influence on Flight)
+    // Refined Magnus effect: Force = S * (w x v)
     // Backspin creates lift, sidespin creates curve
-    const magnusCoefficient = 0.08;
     const magnusForce = new THREE.Vector3()
       .crossVectors(angVel.current, vel.current)
-      .multiplyScalar(magnusCoefficient * delta);
+      .multiplyScalar(MAGNUS_COEFFICIENT * delta);
     vel.current.add(magnusForce);
 
-    // 3. Air Resistance (Drag)
-    const dragForce = vel.current.clone().multiplyScalar(-DRAG * vel.current.length() * delta);
-    vel.current.add(dragForce);
+    // 3. Air Resistance (Quadratic Drag)
+    // Fd = 1/2 * rho * v^2 * Cd * A
+    const speed = vel.current.length();
+    if (speed > 0.01) {
+      const dragMagnitude = 0.5 * AIR_DENSITY * speed * speed * DRAG_COEFFICIENT * BALL_AREA;
+      const dragForce = vel.current.clone().normalize().multiplyScalar(-dragMagnitude * delta);
+      vel.current.add(dragForce);
+    }
 
-    // 4. Update Position
+    // 4. Spin Decay (Air Friction for Rotation)
+    // Spin slowly decays over time in flight
+    angVel.current.multiplyScalar(Math.pow(SPIN_DECAY, delta * 60));
+
+    // 5. Update Position
     pos.current.add(vel.current.clone().multiplyScalar(delta));
     
-    // 5. Update Rotation (Visual and Physics)
+    // 6. Update Rotation (Visual and Physics)
     meshRef.current.position.copy(pos.current);
     meshRef.current.rotation.x += angVel.current.x * delta;
     meshRef.current.rotation.y += angVel.current.y * delta;
@@ -237,6 +292,7 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
         if (v_normal < 0) {
           vel.current.z *= -0.6; // Stiffer than ground
           pos.current.z = BACKBOARD_POS.z + BALL_RADIUS + 0.01;
+          setHasHitBackboard(true);
           
           // Spin influence
           const friction = 0.3;
@@ -280,6 +336,7 @@ function Basketball({ isShot, velocity, onReset, onScore, isGreen, initialPos, i
         // Reflect
         vel.current.sub(normal.clone().multiplyScalar(2 * dot));
         vel.current.multiplyScalar(0.5); // Rim absorbs energy
+        setHasHitRim(true);
         
         // Spin transfer on rim
         const friction = 0.5;
@@ -404,6 +461,51 @@ function BroadcastScoreboard({ score, gameClock, shotClock, teamName }: { score:
   );
 }
 
+function TakeoverEffect({ isActive }: { isActive: boolean }) {
+  return (
+    <AnimatePresence>
+      {isActive && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-[55] pointer-events-none"
+        >
+          {/* Edge Glow */}
+          <div className="absolute inset-0 border-[12px] border-[#ce1141]/30 shadow-[inset_0_0_100px_rgba(206,17,65,0.5)] animate-pulse" />
+          
+          {/* Heat Distortion Effect (Simulated with subtle blur/scale) */}
+          <motion.div 
+            animate={{ 
+              scale: [1, 1.02, 1],
+              opacity: [0.1, 0.2, 0.1]
+            }}
+            transition={{ duration: 2, repeat: Infinity }}
+            className="absolute inset-0 bg-gradient-to-t from-[#ce1141]/10 to-transparent backdrop-blur-[1px]"
+          />
+
+          {/* Activation Text */}
+          <div className="absolute top-1/4 left-1/2 -translate-x-1/2 text-center">
+            <motion.h2
+              initial={{ scale: 0.5, y: 50, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              className="text-8xl font-black italic text-white drop-shadow-[0_0_30px_rgba(206,17,65,1)] uppercase tracking-tighter"
+            >
+              Takeover
+            </motion.h2>
+            <motion.div
+              initial={{ width: 0 }}
+              animate={{ width: '100%' }}
+              transition={{ duration: 0.5, delay: 0.3 }}
+              className="h-2 bg-[#ce1141] mt-2 shadow-[0_0_20px_rgba(206,17,65,0.8)]"
+            />
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
 function PlayerIndicator({ position, stamina, takeoverMeter, isTakeoverActive, isFading, isDribbling }: { 
   position: [number, number, number], 
   stamina: number, 
@@ -466,7 +568,7 @@ function PlayerIndicator({ position, stamina, takeoverMeter, isTakeoverActive, i
     </group>
   );
 }
-function Defender({ initialPosition, playerPos, isDribbling, dribbleCombo, isBroken, isReboundable, ballPos, isJumping }: { 
+function Defender({ initialPosition, playerPos, isDribbling, dribbleCombo, isBroken, isReboundable, ballPos, isJumping, difficulty }: { 
   initialPosition: [number, number, number], 
   playerPos: [number, number, number],
   isDribbling?: boolean,
@@ -474,7 +576,8 @@ function Defender({ initialPosition, playerPos, isDribbling, dribbleCombo, isBro
   isBroken?: boolean,
   isReboundable?: boolean,
   ballPos?: THREE.Vector3,
-  isJumping?: boolean
+  isJumping?: boolean,
+  difficulty: Difficulty
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const currentPos = useRef(new THREE.Vector3(...initialPosition));
@@ -506,6 +609,14 @@ function Defender({ initialPosition, playerPos, isDribbling, dribbleCombo, isBro
 
     const dist = currentPos.current.distanceTo(targetPos);
     
+    // Difficulty-based AI speed
+    const difficultySpeeds: Record<Difficulty, number> = {
+      'Easy': 1.5,
+      'Pro': 2.5,
+      'All-Star': 3.5,
+      'Hall of Fame': 4.5
+    };
+    
     // Defensive logic: stay between player and hoop (0, 0, -4.6)
     // But for simplicity, just move towards player if they are close
     if ((dist < 7 && dist > 1.0) || (isReboundable && dist > 0.5)) {
@@ -514,7 +625,8 @@ function Defender({ initialPosition, playerPos, isDribbling, dribbleCombo, isBro
       direction.y = 0;
       
       // Smooth movement
-      const speed = isReboundable ? 4.0 : 2.5; // Move faster for rebounds
+      const baseSpeed = difficultySpeeds[difficulty];
+      const speed = isReboundable ? baseSpeed * 1.5 : baseSpeed; // Move faster for rebounds
       currentPos.current.add(direction.multiplyScalar(delta * speed));
       groupRef.current.position.x = currentPos.current.x;
       groupRef.current.position.z = currentPos.current.z;
@@ -867,12 +979,13 @@ function Stadium() {
   );
 }
 
-function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }: { 
+function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping, isTakeoverActive }: { 
   player: PlayerType, 
   position: [number, number, number], 
   isFading?: boolean,
   dribbleAnimation?: string | null,
-  isJumping?: boolean
+  isJumping?: boolean,
+  isTakeoverActive?: boolean
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const meshRef = useRef<THREE.Mesh>(null);
@@ -883,9 +996,12 @@ function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }
       const basketPos = new THREE.Vector3(0, 0, -4.6);
       groupRef.current.lookAt(basketPos.x, groupRef.current.position.y, basketPos.z);
 
+      // Faster animations during takeover
+      const animSpeed = isTakeoverActive ? 1.5 : 1;
+
       // Jump Animation
       if (isJumping) {
-        groupRef.current.position.y = Math.sin(state.clock.elapsedTime * 10) * 0.5 + 0.5;
+        groupRef.current.position.y = Math.sin(state.clock.elapsedTime * 10 * animSpeed) * 0.5 + 0.5;
         return;
       }
 
@@ -898,7 +1014,7 @@ function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }
 
       // Dribble Animations
       if (dribbleAnimation) {
-        const time = state.clock.getElapsedTime() * 10;
+        const time = state.clock.getElapsedTime() * 10 * animSpeed;
         switch(dribbleAnimation) {
           case 'Crossover':
             groupRef.current.rotation.z = Math.sin(time) * 0.3;
@@ -913,11 +1029,23 @@ function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }
             groupRef.current.position.z += Math.cos(time) * 0.05;
             break;
           case 'Spin':
-            groupRef.current.rotation.y += 0.8;
+            groupRef.current.rotation.y += 0.8 * animSpeed;
             break;
           case 'Step Back':
             groupRef.current.rotation.x = -0.3;
             groupRef.current.position.z += 0.05;
+            break;
+          case 'In-and-Out':
+            groupRef.current.rotation.z = Math.sin(time * 2) * 0.2;
+            groupRef.current.position.x += Math.sin(time) * 0.05;
+            break;
+          case 'Hesi':
+            groupRef.current.position.y += Math.sin(time * 0.5) * 0.1;
+            groupRef.current.rotation.x = -0.1;
+            break;
+          case 'Shammgod':
+            groupRef.current.position.x += Math.sin(time * 1.5) * 0.4;
+            groupRef.current.rotation.y = Math.cos(time) * 0.5;
             break;
         }
       } else if (!isFading) {
@@ -931,6 +1059,30 @@ function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }
 
   return (
     <group ref={groupRef} position={[position[0], position[1], position[2]]}>
+      {/* Takeover Aura */}
+      {isTakeoverActive && (
+        <group>
+          <pointLight position={[0, 1, 0]} intensity={2} color="#ce1141" distance={3} />
+          <mesh position={[0, 0.1, 0]}>
+            <cylinderGeometry args={[0.8, 1.2, 0.1, 32]} />
+            <meshBasicMaterial color="#ce1141" transparent opacity={0.3} />
+          </mesh>
+          {/* Flame particles (simplified) */}
+          {Array.from({ length: 8 }).map((_, i) => (
+            <mesh 
+              key={i} 
+              position={[
+                Math.sin(i * Math.PI / 4) * 0.6, 
+                Math.random() * 2, 
+                Math.cos(i * Math.PI / 4) * 0.6
+              ]}
+            >
+              <sphereGeometry args={[0.05, 8, 8]} />
+              <meshBasicMaterial color="#ce1141" />
+            </mesh>
+          ))}
+        </group>
+      )}
       {/* Simple Stylized Player */}
       <mesh position={[0, 0.9, 0]} castShadow>
         <capsuleGeometry args={[0.3, 1, 4, 8]} />
@@ -971,6 +1123,50 @@ function PlayerModel({ player, position, isFading, dribbleAnimation, isJumping }
       >
         OVR {player.rating}
       </Text>
+
+      {/* Player Stats Display */}
+      <group position={[0, 1.95, 0]}>
+        <Text
+          position={[-0.45, 0, 0]}
+          fontSize={0.07}
+          color="white"
+          font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+          anchorX="center"
+          anchorY="middle"
+        >
+          SHO {player.stats.shooting}
+        </Text>
+        <Text
+          position={[-0.15, 0, 0]}
+          fontSize={0.07}
+          color="white"
+          font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+          anchorX="center"
+          anchorY="middle"
+        >
+          SPD {player.stats.speed}
+        </Text>
+        <Text
+          position={[0.15, 0, 0]}
+          fontSize={0.07}
+          color="white"
+          font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+          anchorX="center"
+          anchorY="middle"
+        >
+          DEF {player.stats.defense}
+        </Text>
+        <Text
+          position={[0.45, 0, 0]}
+          fontSize={0.07}
+          color="white"
+          font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+          anchorX="center"
+          anchorY="middle"
+        >
+          PLY {player.stats.playmaking}
+        </Text>
+      </group>
     </group>
   );
 }
@@ -1218,10 +1414,145 @@ function Joystick({ onMove }: { onMove: (dir: {x: number, y: number} | null) => 
   );
 }
 
+// --- Scene Component ---
+function Scene({ 
+  playerPos, isShot, shotVelocity, handleReset, handleScore, isGreen, 
+  isDribbling, dribbleType, handleBallUpdate, is3PointContest, contestRack, 
+  isDefenderBroken, isReboundable, ballPos, isDefenderJumping, difficulty, 
+  activePlayer, isFading, dribbleAnimation, isJumping, isTakeoverActive, 
+  dribbleCombo, stamina, takeoverMeter, isShaking, isWarmup = false
+}: any) {
+  return (
+    <>
+      <Suspense fallback={null}>
+        <ScreenShake isShaking={isShaking} />
+        <PerspectiveCamera makeDefault position={isWarmup ? [0, 5, 12] : [8, 5, 12]} fov={isWarmup ? 45 : 50} />
+        {!isWarmup && (
+          <OrbitControls 
+            enablePan={false} 
+            maxPolarAngle={Math.PI / 2} 
+            minDistance={5} 
+            maxDistance={25} 
+            target={[0, 2, -2]}
+          />
+        )}
+        
+        {/* Lighting */}
+        <ambientLight intensity={0.4} />
+        <spotLight 
+          position={[0, 20, 0]} 
+          angle={0.4} 
+          penumbra={0.5} 
+          intensity={3} 
+          castShadow 
+          shadow-mapSize={[2048, 2048]}
+        />
+        <pointLight position={[10, 15, 10]} intensity={1.5} castShadow />
+        <pointLight position={[0, 5, -5]} intensity={1.5} color="white" />
+        <pointLight position={[-10, 5, -10]} intensity={0.5} color="#ce1141" />
+        
+        {/* Environment */}
+        <Stars radius={100} depth={50} count={2000} factor={4} saturation={0} fade speed={1} />
+        <Environment preset="night" />
+        
+        {/* Game Objects */}
+        <Stadium />
+        <Court />
+        <Hoop />
+        {is3PointContest && CONTEST_POSITIONS.map((pos: any, i: number) => (
+          <BallRack 
+            key={i} 
+            position={[pos[0] * 1.1, 0, pos[2] * 1.1]} 
+            active={contestRack === i} 
+          />
+        ))}
+        {!is3PointContest && (
+          <Defender 
+            initialPosition={[0, 0, -2]} 
+            playerPos={playerPos} 
+            isDribbling={isDribbling} 
+            dribbleCombo={dribbleCombo} 
+            isBroken={isDefenderBroken}
+            isReboundable={isReboundable}
+            ballPos={ballPos}
+            isJumping={isDefenderJumping}
+            difficulty={difficulty}
+          />
+        )}
+        <PlayerModel 
+          player={activePlayer} 
+          position={playerPos} 
+          isFading={isFading} 
+          dribbleAnimation={dribbleAnimation}
+          isJumping={isJumping}
+          isTakeoverActive={isTakeoverActive}
+        />
+        <PlayerIndicator 
+          position={playerPos} 
+          stamina={stamina} 
+          takeoverMeter={takeoverMeter} 
+          isTakeoverActive={isTakeoverActive} 
+          isFading={isFading}
+          isDribbling={isDribbling}
+        />
+        <Basketball 
+          isShot={isShot} 
+          velocity={shotVelocity} 
+          onReset={handleReset} 
+          onScore={handleScore} 
+          isGreen={isGreen}
+          initialPos={[playerPos[0], playerPos[1] + 1.2, playerPos[2] - 0.5]}
+          isDribbling={isDribbling}
+          dribbleType={dribbleType}
+          onBallUpdate={handleBallUpdate}
+        />
+
+        {/* Rebound Indicator in 3D */}
+        {isReboundable && (
+          <Text
+            position={[ballPos.x, ballPos.y + 0.5, ballPos.z]}
+            fontSize={0.2}
+            color="#ce1141"
+            font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+            anchorX="center"
+            anchorY="middle"
+          >
+            REBOUND!
+          </Text>
+        )}
+
+        {isWarmup && (
+          <Text
+            position={[0, 6, -5]}
+            fontSize={1}
+            color="#ce1141"
+            font="https://fonts.gstatic.com/s/inter/v12/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hjp-Ek-_EeA.woff"
+            anchorX="center"
+            anchorY="middle"
+            rotation={[0, 0, 0]}
+          >
+            WARM-UP
+          </Text>
+        )}
+        
+        {/* Visual Feedback */}
+        <ContactShadows 
+          position={[0, 0, 0]} 
+          opacity={0.4} 
+          scale={20} 
+          blur={2} 
+          far={4.5} 
+        />
+      </Suspense>
+    </>
+  );
+}
+
 // --- Main App Component ---
 
 export default function App() {
-  const [view, setView] = useState<'landing' | 'game' | 'roster' | 'myCareer' | 'myTeam' | 'store' | 'city'>('landing');
+  const [view, setView] = useState<'landing' | 'game' | 'roster' | 'myCareer' | 'myTeam' | 'store' | 'city' | 'warmup'>('landing');
+  const [difficulty, setDifficulty] = useState<Difficulty>('Pro');
   const [score, setScore] = useState(0);
   const [highScore, setHighScore] = useState(0);
   const [vc, setVc] = useState(1500); // Starting VC
@@ -1241,7 +1572,11 @@ export default function App() {
   const [dribbleType, setDribbleType] = useState<string | null>(null);
   const [dribbleAnimation, setDribbleAnimation] = useState<string | null>(null);
   const [dribbleCombo, setDribbleCombo] = useState(0);
+  const [comboMultiplier, setComboMultiplier] = useState(1.0);
+  const [isShaking, setIsShaking] = useState(false);
   const [lastDribbleTime, setLastDribbleTime] = useState(0);
+  const [dribbleHistory, setDribbleHistory] = useState<string[]>([]);
+  const [specialCombo, setSpecialCombo] = useState<string | null>(null);
   const [isDefenderBroken, setIsDefenderBroken] = useState(false);
   
   // --- Rebounding States ---
@@ -1257,6 +1592,51 @@ export default function App() {
   const [stamina, setStamina] = useState(100);
   const [takeoverMeter, setTakeoverMeter] = useState(0);
   const [isTakeoverActive, setIsTakeoverActive] = useState(false);
+  const [takeoverTimer, setTakeoverTimer] = useState(0);
+  const [warmupTimer, setWarmupTimer] = useState(10);
+  const [isWarmupAnimating, setIsWarmupAnimating] = useState(false);
+
+  // Takeover Logic
+  useEffect(() => {
+    if (takeoverMeter >= 100 && !isTakeoverActive) {
+      setIsTakeoverActive(true);
+      setTakeoverTimer(15); // 15 seconds
+      addLog('TAKEOVER ACTIVATED! 🔥');
+      
+      // Visual/Audio Cue: Screen Shake & Flash
+      if (typeof window !== 'undefined') {
+        const originalBodyStyle = document.body.style.transform;
+        document.body.style.transition = 'transform 0.1s ease-in-out';
+        let shakes = 0;
+        const shakeInterval = setInterval(() => {
+          document.body.style.transform = `translate(${(Math.random() - 0.5) * 10}px, ${(Math.random() - 0.5) * 10}px)`;
+          shakes++;
+          if (shakes > 10) {
+            clearInterval(shakeInterval);
+            document.body.style.transform = originalBodyStyle;
+          }
+        }, 50);
+      }
+    }
+  }, [takeoverMeter, isTakeoverActive]);
+
+  useEffect(() => {
+    let interval: any;
+    if (isTakeoverActive && takeoverTimer > 0) {
+      interval = setInterval(() => {
+        setTakeoverTimer(prev => {
+          if (prev <= 1) {
+            setIsTakeoverActive(false);
+            setTakeoverMeter(0);
+            addLog('Takeover Deactivated.');
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isTakeoverActive, takeoverTimer]);
 
   const [keys, setKeys] = useState<Record<string, boolean>>({});
   const [joystickDir, setJoystickDir] = useState<{x: number, y: number} | null>(null);
@@ -1328,7 +1708,13 @@ export default function App() {
           });
           
           // Stamina drain
-          setStamina(prev => Math.max(0, prev - (0.1 * (isDribbling ? 2 : 1))));
+          const staminaMult = {
+            'Easy': 0.5,
+            'Pro': 1.0,
+            'All-Star': 1.5,
+            'Hall of Fame': 2.0
+          }[difficulty];
+          setStamina(prev => Math.max(0, prev - (0.1 * (isDribbling ? 2 : 1) * staminaMult)));
         }
       }
       frameId = requestAnimationFrame(moveLoop);
@@ -1441,8 +1827,14 @@ export default function App() {
       
       // Timing and distance check
       if (dist < 2.5) {
-        // Success chance based on stat
-        if (Math.random() * 100 < reboundingStat) {
+        // Success chance based on stat, reduced if defender is also jumping
+        let successChance = reboundingStat;
+        if (isDefenderJumping) {
+          successChance *= 0.6; // 40% reduction if contested
+          addLog("Contested rebound!");
+        }
+
+        if (Math.random() * 100 < successChance) {
           handleReboundSuccess(true);
         } else {
           setReboundMessage("Missed Rebound!");
@@ -1468,24 +1860,41 @@ export default function App() {
 
   // --- Defender Rebounding AI ---
   useEffect(() => {
-    if (isReboundable && !isDefenderJumping && Math.random() < 0.05) {
-      // Defender jumps for rebound if close to ball
-      // (Positioning logic is in Defender component)
-      setIsDefenderJumping(true);
-      setTimeout(() => {
-        setIsDefenderJumping(false);
-        // If defender wins rebound
-        if (isReboundable && Math.random() < 0.3) {
-          setIsShot(false);
-          setShotClock(24);
-          setReboundMessage("DEFENDER REBOUND!");
-          addLog("Defender grabs the board!");
-          setPlayerPos([0, 0, 5.5]); // Reset player
-          setTimeout(() => setReboundMessage(null), 2000);
-        }
-      }, 800);
+    if (isReboundable && !isDefenderJumping) {
+      // Defender AI: Check distance to ball
+      // Defender position is handled in Defender component, but we can estimate it here
+      // or pass it up. For now, let's just use a random chance if reboundable is true
+      // but make it more frequent if the ball is low.
+      const jumpChance = ballPos.y < 3.0 ? 0.15 : 0.05;
+      
+      if (Math.random() < jumpChance) {
+        setIsDefenderJumping(true);
+        setTimeout(() => {
+          setIsDefenderJumping(false);
+          // If defender wins rebound (only if player hasn't grabbed it yet)
+          if (isReboundable) {
+            // Defender success chance based on difficulty
+            const defenderReboundChance = {
+              'Easy': 0.15,
+              'Pro': 0.3,
+              'All-Star': 0.45,
+              'Hall of Fame': 0.6
+            }[difficulty];
+
+            if (Math.random() < defenderReboundChance) {
+              setIsShot(false);
+              setShotClock(24);
+              setReboundMessage("DEFENDER REBOUND!");
+              addLog("Defender grabs the board!");
+              // Reset ball to a neutral position or give it to defender
+              setPlayerPos([0, 0, 5.5]); 
+              setTimeout(() => setReboundMessage(null), 2000);
+            }
+          }
+        }, 800);
+      }
     }
-  }, [isReboundable, isDefenderJumping]);
+  }, [isReboundable, isDefenderJumping, ballPos.y, difficulty]);
 
   // --- Power Charging Logic ---
   useEffect(() => {
@@ -1519,45 +1928,104 @@ export default function App() {
     const now = Date.now();
     const isCombo = now - lastDribbleTime < 1500;
     const newCombo = isCombo ? dribbleCombo + 1 : 1;
+    const newMultiplier = isCombo ? Math.min(3.0, comboMultiplier + 0.1) : 1.0;
     
     setDribbleCombo(newCombo);
+    setComboMultiplier(newMultiplier);
     setLastDribbleTime(now);
     setIsDribbling(true);
     setDribbleType(move);
     setDribbleAnimation(move);
+
+    // Update history for chaining
+    const newHistory = [...dribbleHistory, move].slice(-3);
+    setDribbleHistory(newHistory);
+
+    // Check for special combos
+    let comboFound = false;
+    if (newHistory.length === 3) {
+      if (newHistory[0] === 'Crossover' && newHistory[1] === 'Between the Legs' && newHistory[2] === 'Step Back') {
+        setSpecialCombo('ANKLE BREAKER COMBO');
+        setComboMultiplier(prev => Math.min(5.0, prev + 1.0));
+        setTakeoverMeter(prev => Math.min(100, prev + 25));
+        addLog('🔥 SPECIAL COMBO: ANKLE BREAKER! 🔥');
+        comboFound = true;
+        setTimeout(() => setSpecialCombo(null), 2500);
+      } else if (newHistory[0] === 'Spin' && newHistory[1] === 'Behind the Back' && newHistory[2] === 'Crossover') {
+        setSpecialCombo('PRO DRIBBLE CHAIN');
+        setComboMultiplier(prev => Math.min(5.0, prev + 0.8));
+        setTakeoverMeter(prev => Math.min(100, prev + 20));
+        addLog('⚡ SPECIAL COMBO: PRO DRIBBLE CHAIN! ⚡');
+        comboFound = true;
+        setTimeout(() => setSpecialCombo(null), 2500);
+      } else if (newHistory[0] === 'In-and-Out' && newHistory[1] === 'Hesi' && newHistory[2] === 'Shammgod') {
+        setSpecialCombo('ELITE PLAYMAKER');
+        setComboMultiplier(prev => Math.min(5.0, prev + 1.2));
+        setTakeoverMeter(prev => Math.min(100, prev + 30));
+        addLog('🌟 SPECIAL COMBO: ELITE PLAYMAKER! 🌟');
+        comboFound = true;
+        setTimeout(() => setSpecialCombo(null), 2500);
+      } else if (newHistory[1] === 'Hesi' && newHistory[2] === 'Step Back') {
+        setSpecialCombo('SNATCH BACK');
+        setComboMultiplier(prev => Math.min(5.0, prev + 0.5));
+        setTakeoverMeter(prev => Math.min(100, prev + 15));
+        addLog('💨 SPECIAL COMBO: SNATCH BACK! 💨');
+        comboFound = true;
+        setTimeout(() => setSpecialCombo(null), 2500);
+      }
+    }
     
     // Signature Move Effects
     switch(move) {
       case 'Step Back':
-        setPlayerPos(prev => [prev[0], prev[1], prev[2] + 1.2]);
+        setPlayerPos(prev => [prev[0], prev[1], prev[2] + 1.5]);
         break;
       case 'Crossover':
-        setPlayerPos(prev => [prev[0] + (Math.random() > 0.5 ? 1 : -1), prev[1], prev[2]]);
+        setPlayerPos(prev => [prev[0] + (Math.random() > 0.5 ? 1.2 : -1.2), prev[1], prev[2]]);
         break;
       case 'Spin':
-        setPlayerPos(prev => [prev[0], prev[1], prev[2] - 0.5]); // Slight forward burst
+        setPlayerPos(prev => [prev[0], prev[1], prev[2] - 0.8]); // Forward burst
+        break;
+      case 'Shammgod':
+        setPlayerPos(prev => [prev[0] + (Math.random() > 0.5 ? 2.0 : -2.0), prev[1], prev[2] - 0.5]);
+        break;
+      case 'In-and-Out':
+        setPlayerPos(prev => [prev[0] + (Math.random() > 0.5 ? 0.8 : -0.8), prev[1], prev[2]]);
+        break;
+      case 'Hesi':
+        setPlayerPos(prev => [prev[0], prev[1], prev[2] - 0.3]);
         break;
     }
 
     // Check for ankle breaker
     const playmakingStat = activePlayer.stats.playmaking || 80;
-    const breakChance = (playmakingStat / 100) * (newCombo * 0.05);
+    const breakChance = (playmakingStat / 100) * (newCombo * 0.08) + (comboFound ? 0.3 : 0);
     if (Math.random() < breakChance && !isDefenderBroken) {
       addLog(`ANKLE BREAKER! ${activePlayer.name} drops the defender!`);
-      setTakeoverMeter(prev => Math.min(100, prev + 10));
+      setTakeoverMeter(prev => Math.min(100, prev + 15));
       setIsDefenderBroken(true);
-      setTimeout(() => setIsDefenderBroken(false), 2000);
+      setIsShaking(true);
+      setTimeout(() => setIsShaking(false), 500);
+      setTimeout(() => setIsDefenderBroken(false), 2500);
     }
 
-    addLog(`${activePlayer.name} performs a ${move}! ${newCombo > 1 ? `COMBO x${newCombo}` : ''}`);
+    addLog(`${activePlayer.name} performs a ${move}! ${newCombo > 1 ? `COMBO x${newCombo} (${newMultiplier.toFixed(1)}x)` : ''}`);
     
-    // Stamina cost increases with combo
-    const staminaCost = 8 + (newCombo * 2);
+    // Stamina cost increases with combo but reduced by playmaking
+    const staminaMult = {
+      'Easy': 0.5,
+      'Pro': 1.0,
+      'All-Star': 1.5,
+      'Hall of Fame': 2.0
+    }[difficulty];
+
+    const staminaCost = (8 + (newCombo * 2)) * (1 - playmakingStat / 200) * staminaMult;
     setStamina(prev => Math.max(0, prev - staminaCost));
     
-    // Boost takeover for successful moves, scaled by playmaking stat
+    // Boost takeover for successful moves, scaled by playmaking stat and multiplier
     const playmakingFactor = (activePlayer.stats.playmaking || 80) / 100;
-    setTakeoverMeter(prev => Math.min(100, prev + (2 * newCombo * playmakingFactor)));
+    const comboBonus = newMultiplier;
+    setTakeoverMeter(prev => Math.min(100, prev + (3 * newCombo * playmakingFactor * comboBonus)));
     
     setTimeout(() => {
       setIsDribbling(false);
@@ -1984,20 +2452,20 @@ export default function App() {
         name: careerPlayer.name, 
         team: 'MyCAREER', 
         position: careerPlayer.position, 
-        rating: Math.floor(careerPlayer.rating),
+        rating: Math.floor(isTakeoverActive ? 99 : careerPlayer.rating),
         stats: {
-          shooting: careerPlayer.attributes.threePoint,
-          speed: careerPlayer.attributes.speed,
-          defense: careerPlayer.attributes.perimeterDefense,
-          playmaking: careerPlayer.attributes.ballHandle,
-          athleticism: Math.floor((careerPlayer.attributes.vertical + careerPlayer.attributes.strength) / 2),
-          rebounding: careerPlayer.attributes.rebounding,
-          iq: Math.floor((careerPlayer.attributes.awareness + careerPlayer.attributes.passingAccuracy) / 2),
-          consistency: careerPlayer.attributes.shootingConsistency
+          shooting: isTakeoverActive ? Math.min(99, careerPlayer.attributes.threePoint + 15) : careerPlayer.attributes.threePoint,
+          speed: isTakeoverActive ? Math.min(99, careerPlayer.attributes.speed + 15) : careerPlayer.attributes.speed,
+          defense: isTakeoverActive ? Math.min(99, careerPlayer.attributes.perimeterDefense + 15) : careerPlayer.attributes.perimeterDefense,
+          playmaking: isTakeoverActive ? Math.min(99, careerPlayer.attributes.ballHandle + 15) : careerPlayer.attributes.ballHandle,
+          athleticism: Math.floor((careerPlayer.attributes.vertical + careerPlayer.attributes.strength) / 2) + (isTakeoverActive ? 15 : 0),
+          rebounding: isTakeoverActive ? Math.min(99, careerPlayer.attributes.rebounding + 15) : careerPlayer.attributes.rebounding,
+          iq: Math.floor((careerPlayer.attributes.awareness + careerPlayer.attributes.passingAccuracy) / 2) + (isTakeoverActive ? 10 : 0),
+          consistency: isTakeoverActive ? 99 : careerPlayer.attributes.shootingConsistency
         },
         description: careerPlayer.archetype,
         image: '',
-        tier: 'Emerald' as CardTier
+        tier: (isTakeoverActive ? 'Galaxy Opal' : 'Emerald') as CardTier
       }
     : (NBA_ROSTER.find(p => p.id === activePlayerId) || NBA_ROSTER[0]);
 
@@ -2066,16 +2534,38 @@ export default function App() {
     
     setShotVelocity(finalVelocity);
     setIsShot(true);
-    setIsGreen(power > 0.78 && power < 0.82);
+
+    const greenWindowMult = {
+      'Easy': 1.5,
+      'Pro': 1.0,
+      'All-Star': 0.7,
+      'Hall of Fame': 0.4
+    }[difficulty];
+
+    const targetMin = 0.8 - (0.02 * greenWindowMult);
+    const targetMax = 0.8 + (0.02 * greenWindowMult);
+
+    setIsGreen(power > targetMin && power < targetMax);
     
     // Calculate coverage based on defender distance (simulated)
     let coverage = Math.random() * 30; // 0-30% coverage
+    if (difficulty === 'All-Star') coverage *= 1.2;
+    if (difficulty === 'Hall of Fame') coverage *= 1.5;
+    if (difficulty === 'Easy') coverage *= 0.5;
+
     if (fade) coverage *= 0.5; // Fadeaway creates space
     setShotCoverage(coverage);
     
     addLog(`${activePlayer.name} takes the ${fade ? 'FADEAWAY' : 'shot'}! (${coverage < 10 ? 'Wide Open' : coverage < 20 ? 'Open' : 'Contested'})`);
     
-    setStamina(prev => Math.max(0, prev - 15));
+    const staminaMult = {
+      'Easy': 0.5,
+      'Pro': 1.0,
+      'All-Star': 1.5,
+      'Hall of Fame': 2.0
+    }[difficulty];
+
+    setStamina(prev => Math.max(0, prev - (15 * staminaMult)));
     setShotClock(24);
   };
 
@@ -2084,6 +2574,51 @@ export default function App() {
     setIsFading(false);
     setShotMeterSensitivity(1.0);
   };
+
+  // --- Warmup Logic ---
+  useEffect(() => {
+    let interval: any;
+    if (view === 'warmup') {
+      setWarmupTimer(10);
+      interval = setInterval(() => {
+        setWarmupTimer(prev => {
+          if (prev <= 1) {
+            clearInterval(interval);
+            setView('game');
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [view]);
+
+  // Random animations during warmup
+  useEffect(() => {
+    let interval: any;
+    if (view === 'warmup') {
+      interval = setInterval(() => {
+        const rand = Math.random();
+        if (rand < 0.3) {
+          // Random dribble
+          const moves = ['Crossover', 'Behind the Back', 'Between the Legs', 'Spin', 'In-and-Out', 'Hesi', 'Shammgod'];
+          const move = moves[Math.floor(Math.random() * moves.length)];
+          performDribble(move);
+        } else if (rand < 0.5 && !isShot) {
+          // Random shot
+          setPower(0.7 + Math.random() * 0.2);
+          setTimeout(() => handleShoot(Math.random() > 0.7), 500);
+        } else if (rand < 0.8) {
+          // Random movement
+          const targetX = (Math.random() - 0.5) * 10;
+          const targetZ = (Math.random() - 0.5) * 10;
+          setPlayerPos([targetX, 0, targetZ]);
+        }
+      }, 2000);
+    }
+    return () => clearInterval(interval);
+  }, [view, isShot]);
 
   const handleScore = () => {
     if (is3PointContest) {
@@ -2120,16 +2655,7 @@ export default function App() {
       // Update Takeover
       setTakeoverMeter(prev => {
         const next = prev + 15;
-        if (next >= 100) {
-          setIsTakeoverActive(true);
-          addLog('TAKEOVER ACTIVATED! 🔥');
-          setTimeout(() => {
-            setIsTakeoverActive(false);
-            setTakeoverMeter(0);
-          }, 15000); // 15 seconds of takeover
-          return 100;
-        }
-        return next;
+        return Math.min(100, next);
       });
       
       return newScore;
@@ -2138,6 +2664,9 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans selection:bg-[#ce1141] selection:text-white overflow-x-hidden">
+      {/* Takeover Effect */}
+      <TakeoverEffect isActive={isTakeoverActive} />
+
       {/* 67 Meme Overlay */}
       <AnimatePresence>
         {show67Meme && (
@@ -2343,7 +2872,7 @@ export default function App() {
             <span className="text-xs font-bold tabular-nums">{vc.toLocaleString()}</span>
           </div>
           <button 
-            onClick={() => setView(view === 'landing' ? 'game' : 'landing')}
+            onClick={() => setView(view === 'landing' ? 'warmup' : 'landing')}
             className="bg-[#ce1141] hover:bg-[#f0144c] px-6 py-2 rounded-sm text-xs font-bold tracking-widest uppercase transition-all transform hover:scale-105"
           >
             {view === 'landing' ? 'Play Now' : 'Exit Game'}
@@ -2389,7 +2918,7 @@ export default function App() {
                   Experience the most authentic gameplay in franchise history with all-new ProPlay technology, 
                   bringing real NBA movements directly to your controller.
                 </p>
-                <div className="flex flex-col sm:flex-row gap-4 justify-center">
+                <div className="flex flex-col sm:flex-row gap-4 justify-center mb-8">
                   <button 
                     onClick={() => setView('myCareer')}
                     className="group relative bg-white text-black px-10 py-4 font-black text-sm tracking-widest uppercase overflow-hidden"
@@ -2405,6 +2934,26 @@ export default function App() {
                   >
                     View Roster
                   </button>
+                </div>
+
+                {/* Difficulty Selector */}
+                <div className="flex flex-col items-center gap-4">
+                  <div className="text-[10px] font-black tracking-[0.3em] text-white/40 uppercase">Select Difficulty</div>
+                  <div className="flex gap-2 p-1 bg-white/5 border border-white/10 rounded-sm">
+                    {(['Easy', 'Pro', 'All-Star', 'Hall of Fame'] as Difficulty[]).map(d => (
+                      <button
+                        key={d}
+                        onClick={() => setDifficulty(d)}
+                        className={`px-4 py-2 text-[10px] font-black uppercase tracking-widest transition-all ${
+                          difficulty === d 
+                            ? 'bg-[#ce1141] text-white shadow-[0_0_15px_rgba(206,17,65,0.4)]' 
+                            : 'text-white/40 hover:text-white hover:bg-white/5'
+                        }`}
+                      >
+                        {d}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </motion.div>
             </section>
@@ -2460,6 +3009,99 @@ export default function App() {
             <footer className="border-t border-white/5 py-12 px-8 text-center text-[10px] tracking-widest uppercase text-white/30">
               <p>© 2026 Take-Two Interactive Software, Inc. All Rights Reserved.</p>
             </footer>
+          </motion.main>
+        ) : view === 'warmup' ? (
+          <motion.main
+            key="warmup"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-black"
+          >
+            <div className="absolute inset-0 z-0">
+              <Canvas shadows camera={{ position: [0, 5, 12], fov: 45 }}>
+                <Suspense fallback={null}>
+                  <Scene 
+                    playerPos={playerPos}
+                    isShot={isShot}
+                    shotVelocity={shotVelocity}
+                    handleReset={handleReset}
+                    handleScore={handleScore}
+                    isGreen={isGreen}
+                    isDribbling={isDribbling}
+                    dribbleType={dribbleType}
+                    handleBallUpdate={handleBallUpdate}
+                    is3PointContest={false}
+                    contestRack={0}
+                    isDefenderBroken={false}
+                    isReboundable={isReboundable}
+                    ballPos={ballPos}
+                    isDefenderJumping={false}
+                    difficulty={difficulty}
+                    activePlayer={activePlayer}
+                    isFading={false}
+                    dribbleAnimation={dribbleAnimation}
+                    isJumping={false}
+                    isTakeoverActive={false}
+                    dribbleCombo={0}
+                    stamina={stamina}
+                    takeoverMeter={takeoverMeter}
+                    isShaking={isShaking}
+                    isWarmup={true}
+                  />
+                </Suspense>
+              </Canvas>
+            </div>
+
+            {/* Warmup Overlay */}
+            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-black/40 backdrop-blur-sm">
+              <motion.div
+                initial={{ scale: 0.8, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                className="text-center"
+              >
+                <h2 className="text-[12px] font-bold tracking-[0.5em] text-[#ce1141] uppercase mb-4">Pre-Game Warmup</h2>
+                <h1 className="text-8xl font-black italic uppercase tracking-tighter mb-8">Get <span className="text-[#ce1141]">Ready</span></h1>
+                
+                <div className="flex items-center justify-center gap-12 mb-12">
+                  <div className="text-center">
+                    <div className="text-4xl font-black italic mb-1">{warmupTimer}</div>
+                    <div className="text-[10px] font-bold tracking-widest text-white/40 uppercase">Seconds Left</div>
+                  </div>
+                </div>
+
+                <div className="flex gap-4 justify-center">
+                  <button 
+                    onClick={() => setView('game')}
+                    className="bg-white text-black px-10 py-4 font-black text-sm tracking-widest uppercase hover:bg-[#ce1141] hover:text-white transition-all"
+                  >
+                    Skip Warmup
+                  </button>
+                </div>
+              </motion.div>
+
+              <div className="absolute bottom-12 left-1/2 -translate-x-1/2 flex gap-8 items-center">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center overflow-hidden">
+                    <img src={activePlayer.image} alt={activePlayer.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  </div>
+                  <div className="text-left">
+                    <div className="text-[10px] font-bold tracking-widest text-white/40 uppercase">{activePlayer.team}</div>
+                    <div className="text-sm font-black italic uppercase">{activePlayer.name}</div>
+                  </div>
+                </div>
+                <div className="text-2xl font-black italic text-white/20">VS</div>
+                <div className="flex items-center gap-4">
+                  <div className="text-right">
+                    <div className="text-[10px] font-bold tracking-widest text-white/40 uppercase">Opposition</div>
+                    <div className="text-sm font-black italic uppercase">NBA Defenders</div>
+                  </div>
+                  <div className="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center bg-[#222]">
+                    <Users size={20} className="text-white/40" />
+                  </div>
+                </div>
+              </div>
+            </div>
           </motion.main>
         ) : view === 'myTeam' ? (
           <motion.main
@@ -3326,18 +3968,36 @@ export default function App() {
 
               {/* Right Side: Dribble & Shoot */}
               <div className="flex flex-col gap-6 items-end pointer-events-auto">
+                <AnimatePresence>
+                  {specialCombo && (
+                    <motion.div 
+                      initial={{ scale: 0.5, opacity: 0, y: 20 }}
+                      animate={{ scale: 1, opacity: 1, y: 0 }}
+                      exit={{ scale: 1.5, opacity: 0, y: -20 }}
+                      className="bg-yellow-500 text-black font-black italic px-4 py-2 rounded-xl text-xs uppercase tracking-tighter shadow-[0_0_30px_rgba(234,179,8,0.6)] z-10"
+                    >
+                      {specialCombo}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 {dribbleCombo > 0 && (
                   <motion.div 
                     initial={{ opacity: 0, x: 20 }}
                     animate={{ opacity: 1, x: 0 }}
                     className="bg-black/60 backdrop-blur-md border border-yellow-500/30 p-3 rounded-xl flex flex-col items-end gap-1"
                   >
-                    <div className="text-[8px] font-black text-yellow-500 uppercase tracking-widest">Dribble Combo</div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-[10px] font-black text-yellow-500 uppercase tracking-widest">Dribble Combo</div>
+                      <div className="bg-yellow-500 text-black px-1.5 py-0.5 rounded text-[8px] font-black italic">
+                        {comboMultiplier.toFixed(1)}x
+                      </div>
+                    </div>
                     <div className="flex gap-1">
-                      {[1, 2, 3, 4, 5].map(i => (
+                      {[1, 2, 3, 4, 5, 6, 7, 8].map(i => (
                         <div 
                           key={i} 
-                          className={`w-4 h-1 rounded-full transition-all ${i <= dribbleCombo ? 'bg-yellow-500' : 'bg-white/10'}`} 
+                          className={`w-3 h-1 rounded-full transition-all ${i <= dribbleCombo ? 'bg-yellow-500 shadow-[0_0_5px_rgba(234,179,8,0.8)]' : 'bg-white/10'}`} 
                         />
                       ))}
                     </div>
@@ -3374,11 +4034,33 @@ export default function App() {
                   </div>
                   <div className="flex gap-2">
                     <button 
+                      onClick={() => performDribble('In-and-Out')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      I&O
+                    </button>
+                    <button 
+                      onClick={() => performDribble('Hesi')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      Hesi
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={() => performDribble('Shammgod')}
+                      className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
+                    >
+                      Shamm
+                    </button>
+                    <button 
                       onClick={() => performDribble('Step Back')}
                       className="w-16 h-16 rounded-full bg-black/60 backdrop-blur-md border-2 border-white/10 flex items-center justify-center text-[8px] font-black uppercase tracking-widest active:scale-90 transition-all hover:border-[#ce1141]"
                     >
                       Step
                     </button>
+                  </div>
+                  <div className="flex gap-2">
                     <button 
                       onPointerDown={() => { if(!isShot) { setIsChargingFade(true); setPower(0); } }}
                       onPointerUp={() => { if(isChargingFade) { setIsChargingFade(false); handleShoot(true); } }}
@@ -3389,6 +4071,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+
                 <div className="flex gap-2">
                   <button 
                     onClick={handleJump}
@@ -3413,93 +4096,33 @@ export default function App() {
             {/* 3D Scene */}
             <div className="h-full w-full">
               <Canvas shadows>
-                <Suspense fallback={null}>
-                  <PerspectiveCamera makeDefault position={[8, 5, 12]} fov={50} />
-                  <OrbitControls 
-                    enablePan={false} 
-                    maxPolarAngle={Math.PI / 2} 
-                    minDistance={5} 
-                    maxDistance={25} 
-                    target={[0, 2, -2]}
-                  />
-                  
-                  {/* Lighting */}
-                  <ambientLight intensity={0.4} />
-                  <spotLight 
-                    position={[0, 20, 0]} 
-                    angle={0.4} 
-                    penumbra={0.5} 
-                    intensity={3} 
-                    castShadow 
-                    shadow-mapSize={[2048, 2048]}
-                  />
-                  <pointLight position={[10, 15, 10]} intensity={1.5} castShadow />
-                  <pointLight position={[0, 5, -5]} intensity={1.5} color="white" />
-                  <pointLight position={[-10, 5, -10]} intensity={0.5} color="#ce1141" />
-                  
-                  {/* Environment */}
-                  <Stars radius={100} depth={50} count={2000} factor={4} saturation={0} fade speed={1} />
-                  <Environment preset="night" />
-                  
-                  {/* Game Objects */}
-                  <Stadium />
-                  <Court />
-                  <Hoop />
-                  {is3PointContest && CONTEST_POSITIONS.map((pos, i) => (
-                    <BallRack 
-                      key={i} 
-                      position={[pos[0] * 1.1, 0, pos[2] * 1.1]} 
-                      active={contestRack === i} 
-                    />
-                  ))}
-                  {!is3PointContest && (
-                    <Defender 
-                      initialPosition={[0, 0, -2]} 
-                      playerPos={playerPos} 
-                      isDribbling={isDribbling} 
-                      dribbleCombo={dribbleCombo} 
-                      isBroken={isDefenderBroken}
-                      isReboundable={isReboundable}
-                      ballPos={ballPos}
-                      isJumping={isDefenderJumping}
-                    />
-                  )}
-                  <PlayerModel 
-                    player={activePlayer} 
-                    position={playerPos} 
-                    isFading={isFading} 
-                    dribbleAnimation={dribbleAnimation}
-                    isJumping={isJumping}
-                  />
-                  <PlayerIndicator 
-                    position={playerPos} 
-                    stamina={stamina} 
-                    takeoverMeter={takeoverMeter} 
-                    isTakeoverActive={isTakeoverActive} 
-                    isFading={isFading}
-                    isDribbling={isDribbling}
-                  />
-                  <Basketball 
-                    isShot={isShot} 
-                    velocity={shotVelocity} 
-                    onReset={handleReset} 
-                    onScore={handleScore} 
-                    isGreen={isGreen}
-                    initialPos={[playerPos[0], playerPos[1] + 1.2, playerPos[2] - 0.5]}
-                    isDribbling={isDribbling}
-                    dribbleType={dribbleType}
-                    onBallUpdate={handleBallUpdate}
-                  />
-                  
-                  {/* Visual Feedback */}
-                  <ContactShadows 
-                    position={[0, 0, 0]} 
-                    opacity={0.4} 
-                    scale={20} 
-                    blur={2} 
-                    far={4.5} 
-                  />
-                </Suspense>
+                <Scene 
+                  playerPos={playerPos}
+                  isShot={isShot}
+                  shotVelocity={shotVelocity}
+                  handleReset={handleReset}
+                  handleScore={handleScore}
+                  isGreen={isGreen}
+                  isDribbling={isDribbling}
+                  dribbleType={dribbleType}
+                  handleBallUpdate={handleBallUpdate}
+                  is3PointContest={is3PointContest}
+                  contestRack={contestRack}
+                  isDefenderBroken={isDefenderBroken}
+                  isReboundable={isReboundable}
+                  ballPos={ballPos}
+                  isDefenderJumping={isDefenderJumping}
+                  difficulty={difficulty}
+                  activePlayer={activePlayer}
+                  isFading={isFading}
+                  dribbleAnimation={dribbleAnimation}
+                  isJumping={isJumping}
+                  isTakeoverActive={isTakeoverActive}
+                  dribbleCombo={dribbleCombo}
+                  stamina={stamina}
+                  takeoverMeter={takeoverMeter}
+                  isShaking={isShaking}
+                />
               </Canvas>
             </div>
           </motion.main>
